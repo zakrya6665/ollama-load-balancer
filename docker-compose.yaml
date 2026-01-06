@@ -6,8 +6,8 @@ services:
     container_name: ollama
     restart: always
     volumes:
-      - ollama-config:/root/.ollama/config     # Persist config
-      - ollama-models:/root/.ollama/models     # Persist models
+      - ollama-config:/root/.ollama/config     # Persist Ollama config
+      - ollama-models:/root/.ollama/models     # Persist Ollama models
     command: serve
     environment:
       OLLAMA_DEFAULT_MODEL: "gemma:2b"
@@ -37,7 +37,8 @@ services:
       - "3000:3000"
     environment:
       PORT: 3000
-      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_DEFAULT_MODEL: "gemma:2b"
     depends_on:
       ollama:
         condition: service_healthy
