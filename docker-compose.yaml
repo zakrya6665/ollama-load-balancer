@@ -9,7 +9,7 @@ services:
       - /data/coolify/storage/ollama/start-ollama.sh:/start-ollama.sh
       - ollama-config:/root/.ollama/config    # Persist Ollama config
       - ollama-models:/root/.ollama/models    # Persist Ollama models
-    command: ["/start-ollama.sh"]
+    command: serve
 
     environment:
       OLLAMA_DEFAULT_MODEL: "gemma:2b"
