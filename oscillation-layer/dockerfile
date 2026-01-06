@@ -4,10 +4,8 @@ WORKDIR /usr/src/app
 
 COPY package*.json ./
 RUN npm install --omit=dev
-# or npm ci --omit=dev if package-lock.json exists
 
 COPY . .
 
 EXPOSE 3000
-
-CMD ["npm", "start"]
+CMD ["node", "oscillation-layer.js"]
