@@ -31,20 +31,19 @@ async function waitForOllama() {
       if (res.ok) {
         const models = await res.json();
 
-        // Show all models and their status
+        // Log all model IDs
         models.forEach((m) => {
-          console.log(`   - ${m.name}: ${m.status}, RAM: ${m.memory?.used || 0}MB / ${m.memory?.total || 0}MB`);
+          console.log(`   - ${m.id}`);
         });
 
-        const modelLoaded = models.some(
-          (m) => m.name === MODEL_NAME && m.status === "ready"
-        );
+        // Check if the model exists (ignore "status" because it's not returned)
+        const modelLoaded = models.some((m) => m.id === MODEL_NAME);
 
         if (modelLoaded) {
-          console.log(`✅ Ollama is ready and model "${MODEL_NAME}" is loaded!`);
+          console.log(`✅ Ollama is ready and model "${MODEL_NAME}" exists!`);
           return true;
         } else {
-          console.log(`⏳ Model "${MODEL_NAME}" not ready yet (${i + 1}/${RETRIES})`);
+          console.log(`⏳ Model "${MODEL_NAME}" not found yet (${i + 1}/${RETRIES})`);
         }
       }
     } catch (err) {
