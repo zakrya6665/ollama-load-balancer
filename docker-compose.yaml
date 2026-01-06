@@ -3,22 +3,34 @@ version: "3.9"
 services:
   ollama:
     image: ollama/ollama:latest
+    container_name: ollama
     restart: always
     volumes:
       - ollama-data:/root/.ollama
-    command: serve gemma:2b # --port 11434
+    command: serve          # Removed positional argument and --port
+    environment:
+      OLLAMA_DEFAULT_MODEL: "gemma:2b"  # Specify model via env var
+      OLLAMA_MAX_LOADED_MODELS: 2
+      OLLAMA_CONTEXT_LENGTH: 1024
+      OLLAMA_NUM_THREADS: 8
+      OLLAMA_USE_MMAP: "true"
+      OLLAMA_USE_MLOCK: "false"
+      OLLAMA_LOW_VRAM: "false"
+      OLLAMA_VULKAN: 0
+      OLLAMA_GPU_OVERHEAD: 0
+    ports:
+      - "11434:11434"  # Ollama API
 
   oscillation-layer:
     build:
       context: ./oscillation-layer
+    container_name: oscillation-layer
     restart: always
     ports:
       - "3000:3000"
-
     environment:
       PORT: 3000
       OLLAMA_BASE_URL: http://ollama:11434
-
     depends_on:
       - ollama
 
