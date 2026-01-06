@@ -23,38 +23,29 @@ function sleep(ms) {
 // Wait for Ollama to be ready and model loaded
 // ----------------------------
 async function waitForOllama() {
-  console.log(`⏳ Waiting for Ollama at ${OLLAMA_HOST} and model "${MODEL_NAME}" to load...`);
+  console.log(`⏳ Checking if Ollama at ${OLLAMA_HOST} has model "${MODEL_NAME}"...`);
 
-  for (let i = 0; i < RETRIES; i++) {
-    try {
-      const res = await fetch(`${OLLAMA_HOST}${HEALTH_ENDPOINT}`);
-      if (res.ok) {
-        const models = await res.json();
+  try {
+    const res = await fetch(`${OLLAMA_HOST}${HEALTH_ENDPOINT}`);
+    if (!res.ok) throw new Error("Ollama endpoint not reachable");
 
-        // Log all model IDs
-        models.forEach((m) => {
-          console.log(`   - ${m.id}`);
-        });
+    const models = await res.json();
+    models.forEach((m) => console.log(`   - ${m.id}`));
 
-        // Check if the model exists (ignore "status" because it's not returned)
-        const modelLoaded = models.some((m) => m.id === MODEL_NAME);
-
-        if (modelLoaded) {
-          console.log(`✅ Ollama is ready and model "${MODEL_NAME}" exists!`);
-          return true;
-        } else {
-          console.log(`⏳ Model "${MODEL_NAME}" not found yet (${i + 1}/${RETRIES})`);
-        }
-      }
-    } catch (err) {
-      console.log(`⏳ Waiting for Ollama... (${i + 1}/${RETRIES})`);
+    const modelLoaded = models.some((m) => m.id === MODEL_NAME);
+    if (modelLoaded) {
+      console.log(`✅ Ollama is ready and model "${MODEL_NAME}" exists!`);
+      return true;
+    } else {
+      console.error(`❌ Model "${MODEL_NAME}" not found! Exiting.`);
+      process.exit(1);
     }
-    await sleep(DELAY_MS);
+  } catch (err) {
+    console.error("❌ Error reaching Ollama:", err.message);
+    process.exit(1);
   }
-
-  console.error(`❌ Ollama or model "${MODEL_NAME}" did not become ready in time. Exiting.`);
-  process.exit(1);
 }
+
 
 // ----------------------------
 // Main server
