@@ -6,9 +6,9 @@ import express from "express";
 // Configuration
 // ----------------------------
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://ollama:11434"; // Docker service name
-const HEALTH_ENDPOINT = "/v1/completion"; // Ollama health endpoint
-const RETRIES = 10; // Number of attempts to check Ollama
-const DELAY_MS = 3000; // 3 seconds delay between retries
+const HEALTH_ENDPOINT = "/v1/models"; // Ollama health endpoint
+const RETRIES = 20; // Number of attempts to check Ollama
+const DELAY_MS = 5000; // 3 seconds delay between retries
 const PORT = process.env.PORT || 3000;
 
 // ----------------------------
