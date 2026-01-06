@@ -8,8 +8,8 @@ import express from "express";
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://ollama:11434";
 const MODEL_NAME = process.env.OLLAMA_DEFAULT_MODEL || "gemma:2b";
 const HEALTH_ENDPOINT = "/v1/models";
-const RETRIES = 40;          // Number of attempts
-const DELAY_MS = 3000;       // 3s between retries
+const RETRIES = 60;          // More retries for slow loading
+const DELAY_MS = 3000;       // 3 seconds between retries
 const PORT = process.env.PORT || 3000;
 
 // ----------------------------
@@ -23,20 +23,28 @@ function sleep(ms) {
 // Wait for Ollama to be ready and model loaded
 // ----------------------------
 async function waitForOllama() {
-  console.log(`⏳ Waiting for Ollama at ${OLLAMA_HOST} and model ${MODEL_NAME} to load...`);
+  console.log(`⏳ Waiting for Ollama at ${OLLAMA_HOST} and model "${MODEL_NAME}" to load...`);
+
   for (let i = 0; i < RETRIES; i++) {
     try {
       const res = await fetch(`${OLLAMA_HOST}${HEALTH_ENDPOINT}`);
       if (res.ok) {
         const models = await res.json();
+
+        // Show all models and their status
+        models.forEach((m) => {
+          console.log(`   - ${m.name}: ${m.status}, RAM: ${m.memory?.used || 0}MB / ${m.memory?.total || 0}MB`);
+        });
+
         const modelLoaded = models.some(
           (m) => m.name === MODEL_NAME && m.status === "ready"
         );
+
         if (modelLoaded) {
-          console.log(`✅ Ollama is ready and model ${MODEL_NAME} is loaded!`);
+          console.log(`✅ Ollama is ready and model "${MODEL_NAME}" is loaded!`);
           return true;
         } else {
-          console.log(`⏳ Model ${MODEL_NAME} not ready yet (${i + 1}/${RETRIES})`);
+          console.log(`⏳ Model "${MODEL_NAME}" not ready yet (${i + 1}/${RETRIES})`);
         }
       }
     } catch (err) {
@@ -44,7 +52,8 @@ async function waitForOllama() {
     }
     await sleep(DELAY_MS);
   }
-  console.error(`❌ Ollama or model ${MODEL_NAME} did not become ready in time. Exiting.`);
+
+  console.error(`❌ Ollama or model "${MODEL_NAME}" did not become ready in time. Exiting.`);
   process.exit(1);
 }
 
@@ -57,7 +66,7 @@ async function startServer() {
   const app = express();
   app.use(express.json());
 
-  // Health endpoint
+  // Health endpoint for Docker healthcheck
   app.get("/health", (req, res) => res.send("OK"));
 
   // Endpoint to interact with Ollama
@@ -71,6 +80,7 @@ async function startServer() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model: MODEL_NAME, prompt }),
       });
+
       const data = await response.json();
       res.json(data);
     } catch (err) {
@@ -85,5 +95,5 @@ async function startServer() {
   });
 }
 
-// Start
+// Start the app
 startServer();
