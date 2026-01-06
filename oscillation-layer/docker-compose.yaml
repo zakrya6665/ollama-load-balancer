@@ -7,22 +7,22 @@ services:
     ports:
       - "11434:11434"
     volumes:
-      - ./ollama:/root/.ollama
+      - ollama-data:/root/.ollama
     command: serve gemma:2b --port 11434
 
   oscillation-layer:
     image: node:20
     restart: always
 
-    # 👇 VERY IMPORTANT
+    # 🔑 MUST match Coolify persistent storage destination
     working_dir: /usr/src/app/oscillation-layer
 
     ports:
       - "3000:3000"
 
-    # 👇 mount project root
+    # 🔑 same path Coolify uses
     volumes:
-      - .:/usr/src/app
+      - app-data:/usr/src/app
 
     command: sh -c "npm install && npm start"
 
@@ -34,7 +34,11 @@ services:
       - ollama
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: ["CMD-SHELL", "curl -fs http://localhost:3000/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+volumes:
+  app-data:
+  ollama-data:
