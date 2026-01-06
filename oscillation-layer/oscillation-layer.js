@@ -6,9 +6,10 @@ import express from "express";
 // Configuration
 // ----------------------------
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://ollama:11434"; // Docker service name
+const MODEL_NAME = process.env.OLLAMA_DEFAULT_MODEL || "gemma:2b";
 const HEALTH_ENDPOINT = "/v1/models"; // Ollama health endpoint
-const RETRIES = 20; // Number of attempts to check Ollama
-const DELAY_MS = 5000; // 3 seconds delay between retries
+const RETRIES = 40; // Number of attempts to check Ollama
+const DELAY_MS = 3000; // 3 seconds delay between retries
 const PORT = process.env.PORT || 3000;
 
 // ----------------------------
@@ -19,22 +20,28 @@ function sleep(ms) {
 }
 
 // ----------------------------
-// Wait for Ollama to be ready
+// Wait for Ollama to be ready and model loaded
 // ----------------------------
 async function waitForOllama() {
   for (let i = 0; i < RETRIES; i++) {
     try {
       const res = await fetch(`${OLLAMA_HOST}${HEALTH_ENDPOINT}`);
       if (res.ok) {
-        console.log("✅ Ollama is ready!");
-        return true;
+        const models = await res.json();
+        const modelLoaded = models.some((m) => m.name === MODEL_NAME && m.status === "ready");
+        if (modelLoaded) {
+          console.log(`✅ Ollama is ready and model ${MODEL_NAME} is loaded!`);
+          return true;
+        } else {
+          console.log(`⏳ Waiting for model ${MODEL_NAME} to load... (${i + 1}/${RETRIES})`);
+        }
       }
     } catch (err) {
       console.log(`Waiting for Ollama... (${i + 1}/${RETRIES})`);
     }
     await sleep(DELAY_MS);
   }
-  console.error("❌ Ollama did not become ready in time. Exiting.");
+  console.error(`❌ Ollama or model ${MODEL_NAME} did not become ready in time. Exiting.`);
   process.exit(1);
 }
 
@@ -63,7 +70,7 @@ async function startServer() {
       const response = await fetch(`${OLLAMA_HOST}/v1/completion`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ model: MODEL_NAME, prompt }),
       });
 
       const data = await response.json();
