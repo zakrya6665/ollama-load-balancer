@@ -76,8 +76,19 @@ async function sendToRunner(runner, ollamaRequest) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(ollamaRequest)
     });
+
+    // Capture Ollama status
+    if (!response.ok) {
+      const text = await response.text();
+      console.error(`❌ OrdeXa-AI Error [${runner.url}]:`, text);
+      throw new Error(`OrdeXa-AI runner returned ${response.status}`);
+    }
+
     const data = await response.json();
     return { source: "OrdeXa-AI", data };
+  } catch (err) {
+    console.error(`⚠️ Hexabiz-AI: runner ${runner.url} failed:`, err.message);
+    throw err;
   } finally {
     runner.busy = false;
     if (requestQueue.length > 0) {
