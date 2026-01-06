@@ -20,6 +20,12 @@ services:
       OLLAMA_GPU_OVERHEAD: 0
     ports:
       - "11434:11434"  # Ollama API
+    healthcheck:
+     test: ["CMD", "curl", "-f", "http://localhost:11434/v1/models"]
+     interval: 10s
+     timeout: 5s
+     retries: 5
+     start_period: 20s
 
   oscillation-layer:
     build:
