@@ -1,50 +1,84 @@
-version: "3.9"
+// oscillation-layer.js
+import fetch from "node-fetch";
+import express from "express";
 
-services:
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    restart: always
-    ports:
-      - "11434:11434"  # main Ollama serve
-      - "39045:39045"  # runner 1
-      - "11435:11435"  # runner 2
-    volumes:
-      - ./ollama:/root/.ollama  # persist models and config
-    command: serve gemma:2b --port 11434
-    environment:
-      OLLAMA_MAX_LOADED_MODELS: 2
-      OLLAMA_CONTEXT_LENGTH: 1024
-      OLLAMA_NUM_THREADS: 8
-      OLLAMA_USE_MMAP: "true"
-      OLLAMA_USE_MLOCK: "false"
-      OLLAMA_LOW_VRAM: "false"
-      OLLAMA_VULKAN: 0
-      OLLAMA_GPU_OVERHEAD: 0
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/v1/completion"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+// ----------------------------
+// Configuration
+// ----------------------------
+const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://ollama:11434"; // Docker service name
+const HEALTH_ENDPOINT = "/v1/completion"; // Ollama health endpoint
+const RETRIES = 10; // Number of attempts to check Ollama
+const DELAY_MS = 3000; // 3 seconds delay between retries
+const PORT = process.env.PORT || 3000;
 
-  oscillation-layer:
-    image: node:20
-    container_name: oscillation-layer
-    restart: always
-    working_dir: /usr/src/app
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./oscillation-layer:/usr/src/app  # mount your JS + package.json
-    command: sh -c "npm install && node oscillation-layer.js"
-    environment:
-      OLLAMA_API_KEY: "my-secret-key"
-    depends_on:
-      - ollama
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+// ----------------------------
+// Utility: Sleep
+// ----------------------------
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ----------------------------
+// Wait for Ollama to be ready
+// ----------------------------
+async function waitForOllama() {
+  for (let i = 0; i < RETRIES; i++) {
+    try {
+      const res = await fetch(`${OLLAMA_HOST}${HEALTH_ENDPOINT}`);
+      if (res.ok) {
+        console.log("✅ Ollama is ready!");
+        return true;
+      }
+    } catch (err) {
+      console.log(`Waiting for Ollama... (${i + 1}/${RETRIES})`);
+    }
+    await sleep(DELAY_MS);
+  }
+  console.error("❌ Ollama did not become ready in time. Exiting.");
+  process.exit(1);
+}
+
+// ----------------------------
+// Main server
+// ----------------------------
+async function startServer() {
+  // Wait until Ollama is ready
+  await waitForOllama();
+
+  const app = express();
+  app.use(express.json());
+
+  // Health endpoint for Docker healthcheck
+  app.get("/health", (req, res) => res.send("OK"));
+
+  // Example endpoint to interact with Ollama
+  app.post("/ask", async (req, res) => {
+    const { prompt } = req.body;
+
+    if (!prompt) {
+      return res.status(400).json({ error: "Prompt is required" });
+    }
+
+    try {
+      const response = await fetch(`${OLLAMA_HOST}/v1/completion`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+      });
+
+      const data = await response.json();
+      res.json(data);
+    } catch (err) {
+      console.error("Error calling Ollama:", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Start server
+  app.listen(PORT, () => {
+    console.log(`Oscillation-layer server running on port ${PORT}`);
+  });
+}
+
+// Start the app
+startServer();
