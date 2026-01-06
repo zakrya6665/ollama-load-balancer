@@ -1,16 +1,14 @@
-version: "3.9"
-
 services:
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
     restart: always
     ports:
-      - "11434:11434"  # main Ollama serve
-      - "39045:39045"  # runner 1
-      - "11435:11435"  # runner 2
+      - "11434:11434"
+      - "39045:39045"
+      - "11435:11435"
     volumes:
-      - ./ollama:/root/.ollama  # persist models and config
+      - ./ollama:/root/.ollama
     command: serve gemma:2b --port 11434
     environment:
       OLLAMA_MAX_LOADED_MODELS: 2
@@ -21,6 +19,12 @@ services:
       OLLAMA_LOW_VRAM: "false"
       OLLAMA_VULKAN: 0
       OLLAMA_GPU_OVERHEAD: 0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/v1/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   oscillation-layer:
     image: node:20
@@ -30,9 +34,15 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ./:/usr/src/app       # mount the folder (must include package.json + JS)
+      - ./oscillation-layer:/usr/src/app
     command: sh -c "npm install && node oscillation-layer.js"
     environment:
       OLLAMA_API_KEY: "my-secret-key"
     depends_on:
       - ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
