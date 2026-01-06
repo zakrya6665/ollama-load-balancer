@@ -94,7 +94,7 @@ async function processRequest(ollamaRequest, endpointType) {
 
 async function sendToRunner(runner, ollamaRequest, endpointType) {
   runner.busy = true;
-  const orDexaEndpoint = endpointType === "json" ? "/v1/completion" : "/v1/chat";
+ const orDexaEndpoint = endpointType === "json" ? "/api/generate" : "/api/chat";
 
   try {
     const response = await fetch(`${runner.url}${orDexaEndpoint}`, {
