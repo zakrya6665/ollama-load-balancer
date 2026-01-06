@@ -29,7 +29,11 @@ async function waitForOllama() {
     const res = await fetch(`${OLLAMA_HOST}${HEALTH_ENDPOINT}`);
     if (!res.ok) throw new Error("Ollama endpoint not reachable");
 
-    const models = await res.json();
+    const result = await res.json();
+
+    // The array is inside result.data
+    const models = result.data;
+
     models.forEach((m) => console.log(`   - ${m.id}`));
 
     const modelLoaded = models.some((m) => m.id === MODEL_NAME);
@@ -45,6 +49,7 @@ async function waitForOllama() {
     process.exit(1);
   }
 }
+
 
 
 // ----------------------------
