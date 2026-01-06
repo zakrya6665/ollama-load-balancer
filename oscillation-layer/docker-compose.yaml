@@ -6,9 +6,9 @@ services:
     container_name: ollama
     restart: always
     ports:
-      - "11434:11434"  # main serve
-      - "39045:39045"  # runner 1
-      - "11435:11435"  # runner 2
+      - "11434:11434"
+      - "39045:39045"
+      - "11435:11435"
     volumes:
       - ./ollama:/root/.ollama
     command: serve gemma:2b --port 11434
@@ -23,11 +23,16 @@ services:
       OLLAMA_GPU_OVERHEAD: 0
 
   oscillation-layer:
-    build: ./oscillation-layer
+    image: node:20   # use Node official image
     container_name: oscillation-layer
     restart: always
+    working_dir: /usr/src/app
     ports:
       - "3000:3000"
+    volumes:
+      - ./oscillation-layer:/usr/src/app   # mount your JS code directly
+    command: >
+      sh -c "npm install && node oscillation-layer.js"
     environment:
       OLLAMA_API_KEY: "my-secret-key"
     depends_on:
