@@ -6,11 +6,9 @@ services:
     container_name: ollama
     restart: always
     volumes:
-      - /data/coolify/storage/ollama/start-ollama.sh:/start-ollama.sh
-      - ollama-config:/root/.ollama/config    # Persist Ollama config
-      - ollama-models:/root/.ollama/models    # Persist Ollama models
+      - ollama-config:/root/.ollama/config
+      - ollama-models:/root/.ollama/models
     command: serve
-
     environment:
       OLLAMA_DEFAULT_MODEL: "gemma:2b"
       OLLAMA_MAX_LOADED_MODELS: 1
@@ -28,7 +26,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 120s   # Wait 2 minutes for Gemma to load on 8GB RAM
+      start_period: 180s   # Wait 3 minutes for Gemma to load on 8GB RAM
 
   oscillation-layer:
     build:
