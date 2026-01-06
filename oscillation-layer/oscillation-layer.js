@@ -1,69 +1,38 @@
-import express from "express";
-import fetch from "node-fetch";
-import PQueue from "p-queue";
-import { execSync } from "child_process";
+version: "3.9"
 
-const app = express();
-app.use(express.json());
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: always
+    ports:
+      - "11434:11434"  # main serve
+      - "39045:39045"  # runner 1
+      - "11435:11435"  # runner 2
+    volumes:
+      - ./ollama:/root/.ollama
+    command: serve gemma:2b --port 11434
+    environment:
+      OLLAMA_MAX_LOADED_MODELS: 2
+      OLLAMA_CONTEXT_LENGTH: 1024
+      OLLAMA_NUM_THREADS: 8
+      OLLAMA_USE_MMAP: "true"
+      OLLAMA_USE_MLOCK: "false"
+      OLLAMA_LOW_VRAM: "false"
+      OLLAMA_VULKAN: 0
+      OLLAMA_GPU_OVERHEAD: 0
 
-// ======= CONFIG =======
-const API_KEY = process.env.OLLAMA_API_KEY || "my-secret-key";
-
-// --- Detect all active Ollama runners dynamically ---
-function getActiveRunners() {
-  const output = execSync("ps aux | grep '[o]llama runner'").toString();
-  const runners = [];
-
-  output.split("\n").forEach(line => {
-    if (!line.trim()) return;
-    const match = line.match(/--port (\d+)/);
-    if (match) {
-      runners.push({ url: `http://localhost:${match[1]}/v1/completion`, busy: false });
-    }
-  });
-
-  return runners;
-}
-
-// Initial runner list
-let RUNNERS = getActiveRunners();
-console.log(`Oscillation Layer detected ${RUNNERS.length} runner(s)`);
-
-// Queue to limit concurrency across runners
-const queue = new PQueue({ concurrency: RUNNERS.length });
-
-// ======= API Endpoint =======
-app.post("/api/ollama", async (req, res) => {
-  const authHeader = req.headers["authorization"];
-  if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  queue.add(async () => {
-    const runner = RUNNERS.find(r => !r.busy);
-    if (!runner) {
-      return res.status(503).json({ error: "All runners busy, try again" });
-    }
-
-    runner.busy = true;
-    try {
-      const response = await fetch(runner.url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(req.body),
-      });
-      const data = await response.json();
-      res.json(data);
-    } catch (err) {
-      res.status(500).json({ error: "Runner request failed", details: err.message });
-    } finally {
-      runner.busy = false;
-    }
-  });
-});
-
-// ======= Start Server =======
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Oscillation Layer running on http://localhost:${PORT}`);
-});
+  oscillation-layer:
+    image: node:20        # official Node image
+    container_name: oscillation-layer
+    restart: always
+    working_dir: /usr/src/app
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./:/usr/src/app   # mount all files inside this folder
+    command: sh -c "npm install && node oscillation-layer.js"
+    environment:
+      OLLAMA_API_KEY: "my-secret-key"
+    depends_on:
+      - ollama
