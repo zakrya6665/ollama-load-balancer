@@ -11,7 +11,7 @@ const HEALTH_ENDPOINT = "/v1/models";
 const RETRIES = 60;
 const DELAY_MS = 3000;
 
-// Dynamic OrdeXa-AI runners (comma-separated URLs)
+// Runners
 let RUNNERS = (process.env.OLLAMA_RUNNERS || "http://ollama:11434")
   .split(",")
   .map(url => ({ url, busy: false }));
@@ -20,28 +20,55 @@ const requestQueue = [];
 const MAX_QUEUE_SIZE = parseInt(process.env.MAX_QUEUE_SIZE || "50");
 
 // ----------------------------
-// Utility: Sleep
+// Rate limiting per phone
+// ----------------------------
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000"); // 1 min
+const MAX_REQUESTS_PER_WINDOW = parseInt(process.env.MAX_REQUESTS_PER_WINDOW || "5");
+const rateLimits = {}; // { phone: { count, windowStart } }
+
+// ----------------------------
+// Utility
 // ----------------------------
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function checkRateLimit(phone) {
+  const now = Date.now();
+  if (!phone) phone = "anonymous";
+  if (!rateLimits[phone]) {
+    rateLimits[phone] = { count: 1, windowStart: now };
+    return true;
+  }
+
+  const rl = rateLimits[phone];
+  if (now - rl.windowStart > RATE_LIMIT_WINDOW_MS) {
+    rl.count = 1;
+    rl.windowStart = now;
+    return true;
+  }
+
+  if (rl.count >= MAX_REQUESTS_PER_WINDOW) return false;
+  rl.count++;
+  return true;
+}
+
 // ----------------------------
-// Wait for OrdeXa-AI runner readiness
+// Wait for runner
 // ----------------------------
 async function waitForRunner(runner) {
-  console.log(`⏳ Checking if OrdeXa-AI at ${runner.url} has model "${MODEL_NAME}"...`);
+  console.log(`⏳ Checking runner ${runner.url} for model "${MODEL_NAME}"...`);
   for (let i = 0; i < RETRIES; i++) {
     try {
       const res = await fetch(`${runner.url}${HEALTH_ENDPOINT}`);
-      if (!res.ok) throw new Error("OrdeXa-AI endpoint not reachable");
+      if (!res.ok) throw new Error("Endpoint not reachable");
       const result = await res.json();
-      if (result.data && result.data.some(m => m.id === MODEL_NAME)) {
-        console.log(`✅ OrdeXa-AI at ${runner.url} is ready`);
+      if (result.data?.some(m => m.id === MODEL_NAME)) {
+        console.log(`✅ Runner ${runner.url} ready`);
         return true;
       }
     } catch {
-      console.log(`⏳ Retry ${i + 1}/${RETRIES} for ${runner.url}...`);
+      console.log(`⏳ Retry ${i + 1}/${RETRIES}...`);
       await sleep(DELAY_MS);
     }
   }
@@ -50,14 +77,14 @@ async function waitForRunner(runner) {
 }
 
 // ----------------------------
-// Queue + Runner logic
+// Queue + Runner
 // ----------------------------
 async function processRequest(ollamaRequest, endpointType) {
   const freeRunner = RUNNERS.find(r => !r.busy);
   if (freeRunner) return sendToRunner(freeRunner, ollamaRequest, endpointType);
 
   if (requestQueue.length >= MAX_QUEUE_SIZE) {
-    throw new Error("Server busy. Hexabiz-AI request queue full.");
+    throw new Error("Server busy. Request queue full.");
   }
 
   return new Promise((resolve, reject) => {
@@ -85,7 +112,7 @@ async function sendToRunner(runner, ollamaRequest, endpointType) {
     const data = await response.json();
     return { source: "OrdeXa-AI", data };
   } catch (err) {
-    console.error(`⚠️ Hexabiz-AI runner failed:`, err.message);
+    console.error(`⚠️ Runner failed:`, err.message);
     throw err;
   } finally {
     runner.busy = false;
@@ -99,7 +126,7 @@ async function sendToRunner(runner, ollamaRequest, endpointType) {
 }
 
 // ----------------------------
-// Main server
+// Server
 // ----------------------------
 async function startServer() {
   for (const runner of RUNNERS) await waitForRunner(runner);
@@ -108,74 +135,66 @@ async function startServer() {
   app.use(express.json());
 
   // ----------------------------
-  // Health endpoint
+  // Health
   // ----------------------------
   app.get("/health", async (req, res) => {
     const now = new Date().toISOString();
-    try {
-      let healthy = false;
-      for (const runner of RUNNERS) {
-        try {
-          const result = await fetch(`${runner.url}${HEALTH_ENDPOINT}`);
-          const data = await result.json();
-          if (data.data && data.data.some(m => m.id === MODEL_NAME)) {
-            healthy = true;
-            break;
-          }
-        } catch {}
-      }
+    let healthy = false;
+    for (const runner of RUNNERS) {
+      try {
+        const result = await fetch(`${runner.url}${HEALTH_ENDPOINT}`);
+        const data = await result.json();
+        if (data.data?.some(m => m.id === MODEL_NAME)) {
+          healthy = true;
+          break;
+        }
+      } catch {}
+    }
 
-      if (healthy) {
-        return res.json({
-          Status: 200,
-          Status_text: "Success",
-          model_name: "OrdeXa_AI",
-          model_desc: "AI model for order processing",
-          Company: "Hexagon Bizolution",
-          timestamp: now,
-        });
-      } else {
-        return res.status(503).json({
-          Status: 503,
-          Status_text: "Service Unavailable",
-          model_name: "OrdeXa_AI",
-          model_desc: "AI model for order processing",
-          Company: "Hexagon Bizolution",
-          timestamp: now,
-        });
-      }
-    } catch (err) {
-      console.error("[HealthCheck API] Error:", err);
-      return res.status(503).json({
-        Status: 503,
-        Status_text: "Service Unavailable",
+    if (healthy) {
+      return res.json({
+        Status: 200,
+        Status_text: "Success",
         model_name: "OrdeXa_AI",
         model_desc: "AI model for order processing",
         Company: "Hexagon Bizolution",
         timestamp: now,
       });
     }
+    return res.status(503).json({
+      Status: 503,
+      Status_text: "Service Unavailable",
+      model_name: "OrdeXa_AI",
+      model_desc: "AI model for order processing",
+      Company: "Hexagon Bizolution",
+      timestamp: now,
+    });
   });
 
   // ----------------------------
-  // Chat endpoint (default)
+  // Chat endpoint (/ask)
   // ----------------------------
   app.post("/ask", async (req, res) => {
+    const phone = req.headers["x-phone"] || "anonymous";
+    if (!checkRateLimit(phone)) {
+      return res.status(429).json({ error: "Rate limit exceeded" });
+    }
+
     const clientAuth = req.headers.authorization?.split(" ")[1];
     if (!clientAuth || clientAuth !== process.env.OSCILLATION_LAYER_API_KEY) {
-      return res.status(401).json({ error: "Unauthorized. Hexabiz-AI blocked this request." });
+      return res.status(401).json({ error: "Unauthorized" });
     }
 
     const body = req.body;
     if (!body.messages || !body.messages.length) {
-      return res.status(400).json({ error: "messages array is required" });
+      return res.status(400).json({ error: "messages array required" });
     }
 
     const ollamaRequest = {
       model: body.model || MODEL_NAME,
       messages: body.messages,
       temperature: body.temperature ?? 0.25,
-      json: body.response_format?.type === "json_object" ? true : false,
+      json: body.response_format?.type === "json_object" || body.json ? true : false,
     };
 
     try {
@@ -187,24 +206,31 @@ async function startServer() {
   });
 
   // ----------------------------
-  // JSON completion endpoint
+  // JSON endpoint (/ask/json)
   // ----------------------------
   app.post("/ask/json", async (req, res) => {
+    const phone = req.headers["x-phone"] || "anonymous";
+    if (!checkRateLimit(phone)) {
+      return res.status(429).json({ error: "Rate limit exceeded" });
+    }
+
     const clientAuth = req.headers.authorization?.split(" ")[1];
     if (!clientAuth || clientAuth !== process.env.OSCILLATION_LAYER_API_KEY) {
-      return res.status(401).json({ error: "Unauthorized. Hexabiz-AI blocked this request." });
+      return res.status(401).json({ error: "Unauthorized" });
     }
 
     const body = req.body;
     const prompt = body.prompt ?? body.messages?.[0]?.content;
-    if (!prompt) return res.status(400).json({ error: "prompt or messages[0] is required" });
+    if (!prompt) return res.status(400).json({ error: "prompt or messages[0] required" });
 
+    // Build Ollama request, respect response_format if provided
     const ollamaRequest = {
       model: body.model || MODEL_NAME,
       prompt,
       format: "json",
       stream: false,
       temperature: body.temperature ?? 0.25,
+      ...(body.response_format ? { response_format: body.response_format } : {}),
     };
 
     try {
@@ -215,8 +241,8 @@ async function startServer() {
     }
   });
 
-  app.listen(PORT, () => console.log(`🌐 Hexabiz-AI server running on port ${PORT}`));
+  app.listen(PORT, () => console.log(`🌐 Hexabiz-AI running on port ${PORT}`));
 }
 
-// Start the server
+// Start server
 startServer();
