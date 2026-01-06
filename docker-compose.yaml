@@ -6,24 +6,28 @@ services:
     container_name: ollama
     restart: always
     volumes:
-      - ollama-config:/root/.ollama/config     # Persist Ollama config
-      - ollama-models:/root/.ollama/models     # Persist Ollama models
-    command: serve
+      - ollama-config:/root/.ollama/config    # Persist Ollama config
+      - ollama-models:/root/.ollama/models    # Persist Ollama models
+    command: >
+      sh -c "ollama run gemma:2b --port 11434 || serve"
     environment:
       OLLAMA_DEFAULT_MODEL: "gemma:2b"
-      OLLAMA_MAX_LOADED_MODELS: 1          # Use 1 model to reduce RAM usage
+      OLLAMA_MAX_LOADED_MODELS: 1
       OLLAMA_CONTEXT_LENGTH: 1024
       OLLAMA_NUM_THREADS: 8
       OLLAMA_USE_MMAP: "true"
       OLLAMA_USE_MLOCK: "false"
-      OLLAMA_LOW_VRAM: "true"              # Enable low VRAM mode
+      OLLAMA_LOW_VRAM: "true"
       OLLAMA_VULKAN: 0
       OLLAMA_GPU_OVERHEAD: 0
     ports:
       - "11434:11434"
-    # Healthcheck disabled because model loading takes too long on 8GB
     healthcheck:
-      disable: true
+      test: ["CMD", "curl", "-f", "http://localhost:11434/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s   # Wait 2 minutes for Gemma to load on 8GB RAM
 
   oscillation-layer:
     build:
