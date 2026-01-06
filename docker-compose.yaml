@@ -6,7 +6,7 @@ services:
     restart: always
     volumes:
       - ollama-data:/root/.ollama
-    command: serve gemma:2b --port 11434
+    command: serve gemma:2b # --port 11434
 
   oscillation-layer:
     build:
