@@ -16,7 +16,7 @@ let RUNNERS = (process.env.OLLAMA_RUNNERS || "http://ollama:11434")
   .split(",")
   .map(url => ({ url, busy: false }));
 
-// Queue and maximum queue size to avoid overload
+// Queue and maximum queue size
 const requestQueue = [];
 const MAX_QUEUE_SIZE = parseInt(process.env.MAX_QUEUE_SIZE || "50");
 
@@ -54,30 +54,29 @@ async function waitForRunner(runner) {
 // ----------------------------
 // Queue + Runner logic
 // ----------------------------
-async function processRequest(ollamaRequest) {
+async function processRequest(ollamaRequest, endpoint = "/v1/completion") {
   const freeRunner = RUNNERS.find(r => !r.busy);
   if (freeRunner) {
-    return sendToRunner(freeRunner, ollamaRequest);
+    return sendToRunner(freeRunner, ollamaRequest, endpoint);
   } else {
     if (requestQueue.length >= MAX_QUEUE_SIZE) {
       throw new Error("Server busy. Hexabiz-AI request queue full.");
     }
     return new Promise((resolve, reject) => {
-      requestQueue.push({ ollamaRequest, resolve, reject });
+      requestQueue.push({ ollamaRequest, endpoint, resolve, reject });
     });
   }
 }
 
-async function sendToRunner(runner, ollamaRequest) {
+async function sendToRunner(runner, ollamaRequest, endpoint = "/v1/completion") {
   runner.busy = true;
   try {
-    const response = await fetch(`${runner.url}/v1/completion`, {
+    const response = await fetch(`${runner.url}${endpoint}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(ollamaRequest)
     });
 
-    // Capture Ollama status
     if (!response.ok) {
       const text = await response.text();
       console.error(`❌ OrdeXa-AI Error [${runner.url}]:`, text);
@@ -93,7 +92,7 @@ async function sendToRunner(runner, ollamaRequest) {
     runner.busy = false;
     if (requestQueue.length > 0) {
       const next = requestQueue.shift();
-      sendToRunner(runner, next.ollamaRequest)
+      sendToRunner(next.runner || runner, next.ollamaRequest, next.endpoint)
         .then(next.resolve)
         .catch(next.reject);
     }
@@ -104,7 +103,6 @@ async function sendToRunner(runner, ollamaRequest) {
 // Main server
 // ----------------------------
 async function startServer() {
-  // Wait for all runners to be ready
   for (const runner of RUNNERS) {
     await waitForRunner(runner);
   }
@@ -127,9 +125,7 @@ async function startServer() {
             healthy = true;
             break;
           }
-        } catch {
-          // ignore runner errors
-        }
+        } catch {}
       }
 
       if (healthy) {
@@ -183,7 +179,20 @@ async function startServer() {
     // Translate request for OrdeXa-AI
     // ----------------------------
     let ollamaRequest;
-    if (body.response_format?.type === "json_object") {
+    let endpoint = "/v1/completion"; // default
+
+    if (body.messages && body.messages.length > 1) {
+      // Multi-turn chat → /v1/chat
+      endpoint = "/v1/chat";
+      ollamaRequest = {
+        model: body.model || MODEL_NAME,
+        messages: body.messages,
+        temperature: body.temperature ?? 0.1,
+        stream: false,
+        json: true
+      };
+    } else if (body.response_format?.type === "json_object") {
+      // Single prompt → JSON completion
       const content = body.prompt ?? body.messages[0].content;
       ollamaRequest = {
         model: body.model || MODEL_NAME,
@@ -192,6 +201,7 @@ async function startServer() {
         stream: false
       };
     } else {
+      // Default chat-like
       ollamaRequest = {
         model: body.model || MODEL_NAME,
         messages: body.messages ?? [{ role: "user", content: body.prompt }],
@@ -206,7 +216,7 @@ async function startServer() {
     // Send to runner / queue
     // ----------------------------
     try {
-      const data = await processRequest(ollamaRequest);
+      const data = await processRequest(ollamaRequest, endpoint);
       res.json(data);
     } catch (err) {
       console.error("⚠️ Hexabiz-AI: request failed:", err.message);
