@@ -28,7 +28,7 @@ function sleep(ms) {
 }
 
 // ----------------------------
-// Wait for OrdeXa-AI to be ready
+// Wait for OrdeXa-AI runner readiness
 // ----------------------------
 async function waitForRunner(runner) {
   console.log(`⏳ Checking if OrdeXa-AI at ${runner.url} has model "${MODEL_NAME}"...`);
@@ -59,7 +59,6 @@ async function processRequest(ollamaRequest) {
   if (freeRunner) {
     return sendToRunner(freeRunner, ollamaRequest);
   } else {
-    // All runners busy → enqueue or reject if queue full
     if (requestQueue.length >= MAX_QUEUE_SIZE) {
       throw new Error("Server busy. Hexabiz-AI request queue full.");
     }
@@ -74,17 +73,13 @@ async function sendToRunner(runner, ollamaRequest) {
   try {
     const response = await fetch(`${runner.url}/v1/completion`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-        // No need to send HEXAGON_AI_API_KEY to OrdeXa-AI
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(ollamaRequest)
     });
     const data = await response.json();
     return { source: "OrdeXa-AI", data };
   } finally {
     runner.busy = false;
-    // Process queued requests if any
     if (requestQueue.length > 0) {
       const next = requestQueue.shift();
       sendToRunner(runner, next.ollamaRequest)
@@ -106,10 +101,61 @@ async function startServer() {
   const app = express();
   app.use(express.json());
 
+  // ----------------------------
   // Health endpoint
-  app.get("/health", (req, res) => res.send("OK"));
+  // ----------------------------
+  app.get("/health", async (req, res) => {
+    const now = new Date().toISOString();
+    try {
+      let healthy = false;
+      for (const runner of RUNNERS) {
+        try {
+          const result = await fetch(`${runner.url}${HEALTH_ENDPOINT}`);
+          const data = await result.json();
+          if (data.data && data.data.some(m => m.id === MODEL_NAME)) {
+            healthy = true;
+            break;
+          }
+        } catch {
+          // ignore runner errors
+        }
+      }
 
+      if (healthy) {
+        return res.json({
+          Status: 200,
+          Status_text: "Success",
+          model_name: "OrdeXa_AI",
+          model_desc: "AI model for order processing",
+          Company: "Hexagon Bizolution",
+          timestamp: now,
+        });
+      } else {
+        return res.status(503).json({
+          Status: 503,
+          Status_text: "Service Unavailable",
+          model_name: "OrdeXa_AI",
+          model_desc: "AI model for order processing",
+          Company: "Hexagon Bizolution",
+          timestamp: now,
+        });
+      }
+    } catch (err) {
+      console.error("[HealthCheck API] Error checking runners:", err);
+      return res.status(503).json({
+        Status: 503,
+        Status_text: "Service Unavailable",
+        model_name: "OrdeXa_AI",
+        model_desc: "AI model for order processing",
+        Company: "Hexagon Bizolution",
+        timestamp: now,
+      });
+    }
+  });
+
+  // ----------------------------
   // Endpoint for app requests
+  // ----------------------------
   app.post("/ask", async (req, res) => {
     const clientAuth = req.headers.authorization?.split(" ")[1];
     if (!clientAuth || clientAuth !== process.env.OSCILLATION_LAYER_API_KEY) {
@@ -122,10 +168,11 @@ async function startServer() {
       return res.status(400).json({ error: "messages array or prompt is required" });
     }
 
+    // ----------------------------
     // Translate request for OrdeXa-AI
+    // ----------------------------
     let ollamaRequest;
     if (body.response_format?.type === "json_object") {
-      // JSON-format request
       const content = body.prompt ?? body.messages[0].content;
       ollamaRequest = {
         model: body.model || MODEL_NAME,
@@ -134,7 +181,6 @@ async function startServer() {
         stream: false
       };
     } else {
-      // Normal chat request
       ollamaRequest = {
         model: body.model || MODEL_NAME,
         messages: body.messages ?? [{ role: "user", content: body.prompt }],
@@ -145,6 +191,9 @@ async function startServer() {
       };
     }
 
+    // ----------------------------
+    // Send to runner / queue
+    // ----------------------------
     try {
       const data = await processRequest(ollamaRequest);
       res.json(data);
