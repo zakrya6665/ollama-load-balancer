@@ -174,36 +174,39 @@ async function startServer() {
   // ----------------------------
   // Chat endpoint (/ask)
   // ----------------------------
-  app.post("/ask", async (req, res) => {
-    const phone = req.headers["x-phone"] || "anonymous";
-    if (!checkRateLimit(phone)) {
-      return res.status(429).json({ error: "Rate limit exceeded" });
-    }
+ app.post("/ask", async (req, res) => {
+  const phone = req.headers["x-phone"] || "anonymous";
+  if (!checkRateLimit(phone)) {
+    return res.status(429).json({ error: "Rate limit exceeded" });
+  }
 
-    const clientAuth = req.headers.authorization?.split(" ")[1];
-    if (!clientAuth || clientAuth !== process.env.OSCILLATION_LAYER_API_KEY) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
+  const clientAuth = req.headers.authorization?.split(" ")[1];
+  if (!clientAuth || clientAuth !== process.env.OSCILLATION_LAYER_API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
 
-    const body = req.body;
-    if (!body.messages || !body.messages.length) {
-      return res.status(400).json({ error: "messages array required" });
-    }
+  const body = req.body;
+  if (!body.messages || !body.messages.length) {
+    return res.status(400).json({ error: "messages array required" });
+  }
 
-    const ollamaRequest = {
-      model: body.model || MODEL_NAME,
-      messages: body.messages,
-      temperature: body.temperature ?? 0.25,
-      json: body.response_format?.type === "json_object" || body.json ? true : false,
-    };
+  // Build Ollama request for /api/chat
+  const ollamaRequest = {
+    model: body.model || MODEL_NAME,
+    messages: body.messages,
+    temperature: body.temperature ?? 0.25,
+    // Only send format: 'json' if requested
+    ...(body.response_format?.type === "json_object" ? { format: "json" } : {}),
+  };
 
-    try {
-      const data = await processRequest(ollamaRequest, "chat");
-      res.json(data);
-    } catch (err) {
-      res.status(503).json({ error: err.message });
-    }
-  });
+  try {
+    const data = await processRequest(ollamaRequest, "chat");
+    res.json(data);
+  } catch (err) {
+    res.status(503).json({ error: err.message });
+  }
+});
+
 
   // ----------------------------
   // JSON endpoint (/ask/json)
