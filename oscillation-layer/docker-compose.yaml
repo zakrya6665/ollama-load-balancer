@@ -13,16 +13,26 @@ services:
   oscillation-layer:
     image: node:20
     restart: always
-    working_dir: /usr/src/app
+
+    # 👇 VERY IMPORTANT
+    working_dir: /usr/src/app/oscillation-layer
+
     ports:
       - "3000:3000"
+
+    # 👇 mount project root
     volumes:
-      - .:/usr/src/app   # 👈 THIS IS THE KEY FIX
+      - .:/usr/src/app
+
     command: sh -c "npm install && npm start"
+
     environment:
       OLLAMA_API_KEY: "my-secret-key"
+      PORT: 3000
+
     depends_on:
       - ollama
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 30s
