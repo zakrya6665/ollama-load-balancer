@@ -1,11 +1,9 @@
-version: "3.9"
-
 services:
   ollama:
     image: ollama/ollama:latest
     restart: always
     ports:
-      - "11434:11434"
+      - "11434:11434"   # expose only if needed externally
     volumes:
       - ollama-data:/root/.ollama
     command: serve gemma:2b --port 11434
@@ -18,8 +16,9 @@ services:
       - "3000:3000"
 
     environment:
-      OLLAMA_API_KEY: "my-secret-key"
       PORT: 3000
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: gemma:2b
 
     depends_on:
       - ollama
