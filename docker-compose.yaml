@@ -38,7 +38,7 @@ services:
     environment:
       PORT: 3000
       OLLAMA_HOST: http://ollama:11434
-      OLLAMA_DEFAULT_MODEL: "gemma:2b"
+      OLLAMA_DEFAULT_MODEL: '${OLLAMA_DEFAULT_MODEL:-ordexa-gemma}'
     depends_on:
       - ollama
     healthcheck:
