@@ -16,9 +16,12 @@ const EVOLUTION_SERVER_URL = process.env.EVOLUTION_SERVER_URL || "http://evoluti
 const EVOLUTION_GLOBAL_KEY = process.env.EVOLUTION_GLOBAL_KEY; // Top-level Master Server Key
 
 // --- FALLBACK / ROUTER CONFIG ---
-const AI_PROVIDER = (process.env.AI_PROVIDER || "ollama").lower(); // "ollama" or "pollinations"
-const POLLINATIONS_BASE_URL = process.env.POLLINATIONS_BASE_URL || "https://pollinations.ai";
+const AI_PROVIDER = (process.env.AI_PROVIDER || "ollama").lower();  // "ollama" or "pollinations"
 const FALLBACK_MODEL = process.env.FALLBACK_MODEL || "llama-3-70b-instruct";
+const POLLINATIONS_BASE_URL = process.env.POLLINATIONS_BASE_URL || "https://gen.pollinations.ai";
+const FALLBACK_MODEL = process.env.FALLBACK_MODEL || "openai/gpt-5.4-nano";
+const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "YOUR_API_KEY"; 
+
 
 // --- OLLAMA RUNNERS LAYER ---
 let RUNNERS = (process.env.OLLAMA_RUNNERS || "http://ollama:11434")
@@ -125,25 +128,39 @@ function verifyDynamicHmac(req, res, next) {
 // ----------------------------
 // Fallback Pool (Pollinations)
 // ----------------------------
+// ----------------------------
+// Fallback Provider Logic (Decoupled Path Structure)
+// ----------------------------
 async function callPollinationsFallback(prompt) {
-  console.log(`⚠️ Routing payload to Fallback Engine using model: "${FALLBACK_MODEL}"`);
+  console.log(`⚠️ Routing payload to Pollinations Fallback Node using model: "${FALLBACK_MODEL}"`);
   try {
     const encodedPrompt = encodeURIComponent(prompt);
-    const url = `${POLLINATIONS_BASE_URL}/${encodedPrompt}?model=${FALLBACK_MODEL}&seed=42&json=false`;
+    
+    // Dynamically append the specific text processing path (/text) to the base domain
+    const url = `${POLLINATIONS_BASE_URL}/text/${encodedPrompt}?model=${encodeURIComponent(FALLBACK_MODEL)}&key=${POLLINATIONS_API_KEY}`;
     
     const response = await fetch(url, { method: "GET" });
-    if (!response.ok) throw new Error(`Status error: ${response.status}`);
+    if (!response.ok) {
+      throw new Error(`Pollinations API gateway returned network status: ${response.status}`);
+    }
     
     const text = await response.text();
+    
     return {
       source: "Pollinations-Fallback",
-      data: { message: { role: "assistant", content: text.trim() } }
+      data: { 
+        message: { 
+          role: "assistant", 
+          content: text.trim() 
+        } 
+      }
     };
   } catch (err) {
-    console.error("❌ Fallback Router Crashed:", err.message);
-    throw new Error(`Execution error across both system structures: ${err.message}`);
+    console.error("❌ Fallback Router Critical Exception:", err.message);
+    throw new Error(`Execution path error across both processing nodes: ${err.message}`);
   }
 }
+
 
 // ----------------------------
 // Runner Engine Infrastructure
