@@ -10,7 +10,7 @@ services:
 
   oscillation-layer:
     build:
-      context: ./oscillation-layer
+      context: ./hexabiz-gateway
     restart: always
     ports:
       - "3000:3000"
