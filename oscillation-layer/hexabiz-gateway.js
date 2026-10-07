@@ -1,376 +1,377 @@
 import express from "express";
+import helmet from "helmet";
 import fetch from "node-fetch";
 import crypto from "crypto";
 
-// ----------------------------
-// Configuration & Env Variables
-// ----------------------------
-const PORT = process.env.PORT || 3000;
+// ============================================================
+// Configuration
+// ============================================================
+
+const PORT = Number.parseInt(process.env.PORT || "3000", 10);
 const MODEL_NAME = process.env.OLLAMA_DEFAULT_MODEL || "gemma:2b";
-const HEALTH_ENDPOINT = "/v1/models";
-const RETRIES = 60;
-const DELAY_MS = 3000;
 
-// --- EVOLUTION API CONFIG ---
 const EVOLUTION_SERVER_URL = process.env.EVOLUTION_SERVER_URL || "http://evolution-api:8080";
-const EVOLUTION_GLOBAL_KEY = process.env.EVOLUTION_GLOBAL_KEY; // Top-level Master Server Key
+const EVOLUTION_GLOBAL_KEY = process.env.EVOLUTION_GLOBAL_KEY;
+const APP_ENROLLMENT_KEY = process.env.APP_ENROLLMENT_KEY;
 
-// --- FALLBACK / ROUTER CONFIG ---
-const AI_PROVIDER = (process.env.AI_PROVIDER || "ollama").lower();  // "ollama" or "pollinations"
-const FALLBACK_MODEL = process.env.FALLBACK_MODEL || "llama-3-70b-instruct";
-const POLLINATIONS_BASE_URL = process.env.POLLINATIONS_BASE_URL || "https://gen.pollinations.ai";
+const AI_PROVIDER = (process.env.AI_PROVIDER || "ollama").toLowerCase();
 const FALLBACK_MODEL = process.env.FALLBACK_MODEL || "openai/gpt-5.4-nano";
-const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "YOUR_API_KEY"; 
+const POLLINATIONS_BASE_URL = process.env.POLLINATIONS_BASE_URL || "https://text.pollinations.ai"; // Fixed URL
+const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY;
 
+const MAX_QUEUE_SIZE = positiveInt(process.env.MAX_QUEUE_SIZE, 50);
+const RATE_LIMIT_WINDOW_MS = positiveInt(process.env.RATE_LIMIT_WINDOW_MS, 60_000);
+const MAX_REQUESTS_PER_WINDOW = positiveInt(process.env.MAX_REQUESTS_PER_WINDOW, 20);
+const HMAC_MAX_SKEW_SECONDS = positiveInt(process.env.HMAC_MAX_SKEW_SECONDS, 60);
+const OUTBOUND_TIMEOUT_MS = positiveInt(process.env.OUTBOUND_TIMEOUT_MS, 120_000);
+const MAX_PROMPT_LENGTH = positiveInt(process.env.MAX_PROMPT_LENGTH, 12_000);
 
-// --- OLLAMA RUNNERS LAYER ---
-let RUNNERS = (process.env.OLLAMA_RUNNERS || "http://ollama:11434")
+const RUNNERS = (process.env.OLLAMA_RUNNERS || "http://ollama:11434")
   .split(",")
-  .map(url => ({ url, busy: false }));
+  .map((value) => value.trim().replace(/\/+$/, ""))
+  .filter(Boolean)
+  .map((url) => ({ url, busy: false }));
 
-const requestQueue = [];
-const MAX_QUEUE_SIZE = parseInt(process.env.MAX_QUEUE_SIZE || "50");
+const rateLimits = new Map();
+const usedNonces = new Map();
+const instanceCreationLimits = new Map(); // STRICT IP LIMITER
 
-// --- RATE LIMITING ---
-const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000"); // 1 minute
-const MAX_REQUESTS_PER_WINDOW = parseInt(process.env.MAX_REQUESTS_PER_WINDOW || "5");
-const rateLimits = {}; // Memory store: { deviceId: { count, windowStart } }
+function positiveInt(value, fallback) {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
 
-// ----------------------------
-// Helper Utilities
-// ----------------------------
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function safeEqualText(a, b) {
+  const left = Buffer.from(String(a), "utf8");
+  const right = Buffer.from(String(b), "utf8");
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function isValidDeviceId(deviceId) {
+  return typeof deviceId === "string" && /^[A-Za-z0-9._:-]{8,128}$/.test(deviceId);
+}
+
+function isValidIP(ip) {
+  const ipv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+  const ipv6 = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$/;
+  return ipv4.test(ip) || ipv6.test(ip);
+}
+
+function deriveDeviceSecret(deviceId) {
+  return crypto.createHmac("sha256", EVOLUTION_GLOBAL_KEY).update(`device:${deviceId}`, "utf8").digest("hex");
+}
+
+function deriveInstanceName(deviceId) {
+  const digest = crypto.createHash("sha256").update(deviceId, "utf8").digest("hex").slice(0, 32);
+  return `device_${digest}`;
 }
 
 function checkRateLimit(deviceId) {
   const now = Date.now();
-  const key = deviceId || "anonymous";
-  
-  if (!rateLimits[key]) {
-    rateLimits[key] = { count: 1, windowStart: now };
+  const existing = rateLimits.get(deviceId);
+
+  if (!existing || now - existing.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    rateLimits.set(deviceId, { count: 1, windowStart: now });
     return true;
   }
 
-  const rl = rateLimits[key];
-  if (now - rl.windowStart > RATE_LIMIT_WINDOW_MS) {
-    rl.count = 1;
-    rl.windowStart = now;
-    return true;
-  }
-
-  if (rl.count >= MAX_REQUESTS_PER_WINDOW) return false;
-  rl.count++;
+  if (existing.count >= MAX_REQUESTS_PER_WINDOW) return false;
+  existing.count += 1;
   return true;
 }
 
-/**
- * Derives a secure, static, reproducible unique token for an individual device.
- * Ensures the Android client cannot guess it without its physical deviceId.
- */
-function deriveDeviceSecret(deviceId) {
-  return crypto
-    .createHmac("sha256", EVOLUTION_GLOBAL_KEY)
-    .update(deviceId)
-    .digest("hex");
+function cleanupNonces(now) {
+  for (const [nonce, expiresAt] of usedNonces) {
+    if (expiresAt <= now) usedNonces.delete(nonce);
+  }
 }
 
-// ----------------------------
-// Security Middleware (HMAC)
-// ----------------------------
-/**
- * Dynamic HMAC validation to authorize AI and generic operations.
- * Prevents tampering, structural reverse-engineering, and replay attacks.
- */
-function verifyDynamicHmac(req, res, next) {
-  const deviceId = req.headers["x-device-id"];
-  const sentSignature = req.headers["x-signature"];
-  const timestamp = req.headers["x-timestamp"];
+function consumeNonce(nonce, now) {
+  cleanupNonces(now);
+  if (usedNonces.has(nonce)) return false;
+  if (usedNonces.size > 10000) usedNonces.clear(); // Prevent memory leak
+  usedNonces.set(nonce, now + HMAC_MAX_SKEW_SECONDS * 1000);
+  return true;
+}
 
-  if (!deviceId || !sentSignature || !timestamp) {
-    return res.status(401).json({ error: "Unauthorized: Missing core validation headers" });
+function extractPrompt(value) {
+  if (typeof value === "string") return value.slice(0, MAX_PROMPT_LENGTH);
+  if (Array.isArray(value)) {
+    const last = value[value.length - 1];
+    if (last && typeof last.content === "string") return last.content.slice(0, MAX_PROMPT_LENGTH);
   }
+  return "";
+}
 
-  // 1. Prevent Replay Attacks: Restrict execution windows to 60 seconds
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - parseInt(timestamp)) > 60) {
-    return res.status(401).json({ error: "Unauthorized: Signature window expired" });
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OUTBOUND_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
   }
+}
 
-  // 2. Fetch the target validation secret key for this specific device
-  const deviceSpecificSecret = deriveDeviceSecret(deviceId);
+// ============================================================
+// Security Middleware
+// ============================================================
 
-  // 3. Reconstruct payload structure to sign
-  const stringifiedBody = JSON.stringify(req.body);
-  const dataToSign = `${timestamp}.${stringifiedBody}`;
-
-  const expectedSignature = crypto
-    .createHmac("sha256", deviceSpecificSecret)
-    .update(dataToSign)
-    .digest("hex");
-
-  // 4. Constant-time comparison checking to eliminate execution timing side-channels
-  const isSignatureValid = crypto.timingSafeEqual(
-    Buffer.from(sentSignature, "utf-8"),
-    Buffer.from(expectedSignature, "utf-8")
-  );
-
-  if (!isSignatureValid) {
-    return res.status(401).json({ error: "Unauthorized: Invalid application signature" });
+function verifyEnrollmentKey(req, res, next) {
+  const supplied = req.get("x-enrollment-key");
+  if (!supplied || !safeEqualText(supplied, APP_ENROLLMENT_KEY)) {
+    return res.status(401).json({ error: "Unauthorized" });
   }
-
-  // Assign details onto request context for subsequent processing access
-  req.deviceId = deviceId;
-  req.deviceToken = deviceSpecificSecret;
   next();
 }
 
-// ----------------------------
-// Fallback Pool (Pollinations)
-// ----------------------------
-// ----------------------------
-// Fallback Provider Logic (Decoupled Path Structure)
-// ----------------------------
+// STRICT IP RATE LIMITER FOR INSTANCE CREATION
+function strictIpRateLimit(req, res, next) {
+  // Extract real IP, accounting for Coolify/Nginx reverse proxy
+  const ip = req.headers['x-forwarded-for'] 
+    ? req.headers['x-forwarded-for'].split(',')[0].trim() 
+    : (req.ip || req.connection.remoteAddress);
+
+  if (!isValidIP(ip)) {
+    console.warn(`[SECURITY] Invalid IP format attempted instance creation: ${ip}`);
+    return res.status(400).json({ error: "Invalid network request." });
+  }
+
+  const now = Date.now();
+  const existing = instanceCreationLimits.get(ip);
+  const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+
+  if (!existing || (now - existing.windowStart) > TWENTY_FOUR_HOURS_MS) {
+    instanceCreationLimits.set(ip, { count: 1, windowStart: now });
+    return next();
+  }
+
+  if (existing.count >= 3) {
+    console.warn(`[SECURITY] IP ${ip} exceeded strict instance creation limit (3/24h).`);
+    return res.status(429).json({ 
+      error: "Strict limit reached: Maximum 3 device linkings allowed per 24 hours from this network." 
+    });
+  }
+
+  existing.count += 1;
+  next();
+}
+
+function verifyDynamicHmac(req, res, next) {
+  const deviceId = req.get("x-device-id");
+  const signature = req.get("x-signature");
+  const timestampHeader = req.get("x-timestamp");
+  const nonce = req.get("x-nonce");
+
+  if (!isValidDeviceId(deviceId) || !signature || !timestampHeader || !nonce || !/^[A-Za-z0-9._~-]{16,128}$/.test(nonce)) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const timestamp = Number.parseInt(timestampHeader, 10);
+  if (!Number.isSafeInteger(timestamp)) return res.status(401).json({ error: "Unauthorized" });
+
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - timestamp) > HMAC_MAX_SKEW_SECONDS) {
+    return res.status(401).json({ error: "Signature expired" });
+  }
+
+  const deviceSecret = deriveDeviceSecret(deviceId);
+  const bodyText = JSON.stringify(req.body ?? {});
+  const dataToSign = `${timestamp}.${nonce}.${bodyText}`;
+
+  const expectedSignature = crypto.createHmac("sha256", deviceSecret).update(dataToSign, "utf8").digest("hex");
+
+  if (!safeEqualText(signature, expectedSignature)) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  if (!consumeNonce(`${deviceId}:${nonce}`, Date.now())) {
+    return res.status(401).json({ error: "Replay detected" });
+  }
+
+  if (!checkRateLimit(deviceId)) {
+    return res.status(429).json({ error: "Too many requests. Calm down." });
+  }
+
+  req.deviceId = deviceId;
+  req.deviceToken = deviceSecret;
+  next();
+}
+
+function verifyPlayIntegrityToken(req, res, next) {
+  const integrityToken = req.get("x-play-integrity-token");
+  if (!integrityToken) return next(); // Allow bypass for local testing
+  // TODO: Validate integrityToken via Google Play Developer APIs here for production
+  next();
+}
+
+// ============================================================
+// AI & Fallback Logic
+// ============================================================
+
 async function callPollinationsFallback(prompt) {
-  console.log(`⚠️ Routing payload to Pollinations Fallback Node using model: "${FALLBACK_MODEL}"`);
-  try {
-    const encodedPrompt = encodeURIComponent(prompt);
-    
-    // Dynamically append the specific text processing path (/text) to the base domain
-    const url = `${POLLINATIONS_BASE_URL}/text/${encodedPrompt}?model=${encodeURIComponent(FALLBACK_MODEL)}&key=${POLLINATIONS_API_KEY}`;
-    
-    const response = await fetch(url, { method: "GET" });
-    if (!response.ok) {
-      throw new Error(`Pollinations API gateway returned network status: ${response.status}`);
-    }
-    
-    const text = await response.text();
-    
-    return {
-      source: "Pollinations-Fallback",
-      data: { 
-        message: { 
-          role: "assistant", 
-          content: text.trim() 
-        } 
-      }
-    };
-  } catch (err) {
-    console.error("❌ Fallback Router Critical Exception:", err.message);
-    throw new Error(`Execution path error across both processing nodes: ${err.message}`);
-  }
+  if (!POLLINATIONS_API_KEY) throw new Error("Pollinations fallback is not configured");
+  const cleanPrompt = extractPrompt(prompt);
+  if (!cleanPrompt) throw new Error("Fallback prompt is empty");
+
+  // Fixed URL construction to prevent double "/text/"
+  const url = new URL(encodeURIComponent(cleanPrompt), POLLINATIONS_BASE_URL);
+  url.searchParams.set("model", FALLBACK_MODEL);
+  url.searchParams.set("key", POLLINATIONS_API_KEY);
+
+  const response = await fetchWithTimeout(url.toString(), { method: "GET", headers: { Accept: "text/plain" } });
+  if (!response.ok) throw new Error(`Fallback provider returned HTTP ${response.status}`);
+
+  const text = (await response.text()).trim();
+  return { source: "Pollinations-Fallback", data: { message: { role: "assistant", content: text } } };
 }
 
-
-// ----------------------------
-// Runner Engine Infrastructure
-// ----------------------------
 async function waitForRunner(runner) {
-  console.log(`⏳ Monitoring execution path ${runner.url} for target model "${MODEL_NAME}"...`);
-  for (let i = 0; i < RETRIES; i++) {
+  const deadline = Date.now() + 180_000;
+  while (Date.now() < deadline) {
     try {
-      const res = await fetch(`${runner.url}${HEALTH_ENDPOINT}`);
-      if (!res.ok) throw new Error("Unreachable endpoint context");
-      const result = await res.json();
-      if (result.data?.some(m => m.id === MODEL_NAME)) {
-        console.log(`✅ Runner platform verified: ${runner.url}`);
-        return true;
+      const response = await fetchWithTimeout(`${runner.url}/api/tags`, { method: "GET", headers: { Accept: "application/json" } });
+      if (response.ok) {
+        const result = await response.json();
+        const models = Array.isArray(result.models) ? result.models : [];
+        if (models.some((model) => model.name === MODEL_NAME || model.model === MODEL_NAME)) return;
       }
-    } catch {
-      console.log(`⏳ Retrying verification loop ${i + 1}/${RETRIES}...`);
-      await sleep(DELAY_MS);
-    }
+    } catch { /* Retry */ }
+    await sleep(3000);
   }
-  console.error(`❌ Dependency failure: "${MODEL_NAME}" was not localized on ${runner.url}.`);
-  process.exit(1);
-}
-
-async function processRequest(ollamaRequest, endpointType, promptForFallback) {
-  if (AI_PROVIDER === "pollinations") {
-    return await callPollinationsFallback(promptForFallback);
-  }
-
-  const freeRunner = RUNNERS.find(r => !r.busy);
-  if (freeRunner) return sendToRunner(freeRunner, ollamaRequest, endpointType);
-
-  if (requestQueue.length >= MAX_QUEUE_SIZE) {
-    console.log("⚠️ Queue boundary breached. Routing current traffic to fallback node.");
-    return await callPollinationsFallback(promptForFallback);
-  }
-
-  return new Promise((resolve, reject) => {
-    requestQueue.push({ ollamaRequest, endpointType, resolve, reject });
-  });
+  throw new Error(`Ollama runner ${runner.url} did not expose model ${MODEL_NAME}`);
 }
 
 async function sendToRunner(runner, ollamaRequest, endpointType) {
   runner.busy = true;
-  const targetEndpoint = endpointType === "json" ? "/api/generate" : "/api/chat";
+  const targetEndpoint = endpointType === "chat" ? "/api/chat" : "/api/generate";
 
   try {
-    const response = await fetch(`${runner.url}${targetEndpoint}`, {
+    const response = await fetchWithTimeout(`${runner.url}${targetEndpoint}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(ollamaRequest),
+      body: JSON.stringify({ ...ollamaRequest, model: MODEL_NAME, stream: false }),
     });
 
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Runner connection error context: ${response.status} - ${text}`);
-    }
-
+    if (!response.ok) throw new Error(`Ollama runner returned HTTP ${response.status}`);
     const data = await response.json();
-    return { source: "OrdeXa-AI", data };
-  } catch (err) {
-    console.error(`⚠️ Runner path exception encountered:`, err.message);
-    throw err;
+    return { source: "Ollama", data };
   } finally {
     runner.busy = false;
-    if (requestQueue.length > 0) {
-      const next = requestQueue.shift();
-      sendToRunner(next.runner || runner, next.ollamaRequest, next.endpointType)
-        .then(next.resolve)
-        .catch(next.reject);
-    }
   }
 }
 
-// ----------------------------
-// Core Express Server Initialization
-// ----------------------------
-async function startServer() {
-  if (!EVOLUTION_GLOBAL_KEY) {
-    console.error("❌ Critical Failure: EVOLUTION_GLOBAL_KEY environmental variable missing.");
-    process.exit(1);
-  }
+async function getAvailableRunner() {
+  return RUNNERS.find((r) => !r.busy);
+}
 
-  if (AI_PROVIDER !== "pollinations") {
-    for (const runner of RUNNERS) await waitForRunner(runner);
-  }
+// ============================================================
+// Express App Initialization & Routes
+// ============================================================
 
-  const app = express();
-  app.use(express.json());
+const app = express();
+app.use(helmet());
+app.use(express.json({ limit: "2mb" }));
 
-  // System Diagnostics Route
-  app.get("/health", (req, res) => {
-    res.json({ status: 200, system: "Hexabiz-Orchestration-Service", live: true });
-  });
-
-  // -------------------------------------------------------------
-  // SECURE EVOLUTION API INSTANCE ROUTE (Zero-Login Architecture)
-  // -------------------------------------------------------------
-  app.post("/instance/auto-connect", async (req, res) => {
+// --- TIER 1: HIGH VALUE ADMIN OPERATIONS ---
+app.post(
+  "/api/instance/create",
+  strictIpRateLimit,          // 1. Strict IP check (Max 3 per 24h)
+  verifyEnrollmentKey,        // 2. App enrollment key check
+  verifyPlayIntegrityToken,   // 3. Optional Google Play Integrity check
+  async (req, res) => {
     const { deviceId } = req.body;
-    if (!deviceId) return res.status(400).json({ error: "Device hardware signature required" });
 
-    // Derive a unique token dedicated specifically to this device
-    const specificDeviceToken = deriveDeviceSecret(deviceId);
-    const instanceName = `device_${deviceId}`;
+    if (!isValidDeviceId(deviceId)) {
+      return res.status(400).json({ error: "Invalid device ID assignment" });
+    }
+
+    const instanceName = deriveInstanceName(deviceId);
+    const token = deriveDeviceSecret(deviceId);
 
     try {
-      const response = await fetch(`${EVOLUTION_SERVER_URL}/instance/create`, {
+      // FIXED: Added backticks for template literal
+      const evoResponse = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/create`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "apikey": EVOLUTION_GLOBAL_KEY // Isolated safely on server side
+          "apikey": EVOLUTION_GLOBAL_KEY,
         },
         body: JSON.stringify({
           instanceName: instanceName,
-          token: specificDeviceToken,
-          qrcode: true
-        })
+          token: token,
+          qrcode: true,
+        }),
       });
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        return res.status(response.status).json({ error: "Evolution platform registration error", details: data });
-      }
-
-      // Return configuration metadata straight back to the client device
-      return res.json({
-        success: true,
-        instanceName: instanceName,
-        instanceToken: specificDeviceToken, // Client securely writes this locally for messaging
-        qrcode: data.qrcode?.code || null,
-        pairingCode: data.qrcode?.pairingCode || null
-      });
-
+      const data = await evoResponse.json();
+      return res.status(evoResponse.status).json(data);
     } catch (err) {
-      console.error("❌ Instance registration pipeline error:", err.message);
-      return res.status(503).json({ error: "Evolution engine access failure" });
+      return res.status(500).json({ error: "Evolution API context error", details: err.message });
     }
-  });
+  }
+);
 
-  // -------------------------------------------------------------
-// AI ROUTING LAYER ENDPOINTS (Protected via Dynamic HMAC)
-// -------------------------------------------------------------
-app.post("/ask", verifyDynamicHmac, async (req, res) => {
-const body = req.body;
-const fallbackPrompt = body.messages?.[body.messages.length - 1]?.content || "Hello";
-if (!checkRateLimit(req.deviceId)) {
-console.log(⚠️ Rate monitoring threshold breached for ${req.deviceId}. Forcing offload channel.);
-try {
-const fallbackData = await callPollinationsFallback(fallbackPrompt);
-return res.json(fallbackData);
-} catch (err) {
-return res.status(429).json({ error: "Rate thresholds surpassed, backup pipeline failed." });
-}
-}
-if (!body.messages || !body.messages.length) {
-return res.status(400).json({ error: "Structured message configuration array is required" });
-}
-const ollamaRequest = {
-model: body.model || MODEL_NAME,
-messages: body.messages,
-temperature: body.temperature ?? 0.25,
-...(body.response_format?.type === "json_object" ? { format: "json" } : {}),
-};
-try {
-const data = await processRequest(ollamaRequest, "chat", fallbackPrompt);
-res.json(data);
-} catch (err) {
-try {
-const fallbackData = await callPollinationsFallback(fallbackPrompt);
-res.json(fallbackData);
-} catch (fallbackErr) {
-res.status(503).json({ error: err.message });
-}
-}
+// --- TIER 2: ROUTINE OPERATIONS ---
+app.post("/api/chat", verifyDynamicHmac, async (req, res) => {
+  const { messages, prompt } = req.body;
+  const ollamaPayload = messages ? { messages } : { prompt: extractPrompt(prompt) };
+  const endpointType = messages ? "chat" : "generate";
+
+  if (AI_PROVIDER === "ollama") {
+    const runner = await getAvailableRunner();
+    if (runner) {
+      try {
+        const result = await sendToRunner(runner, ollamaPayload, endpointType);
+        return res.json(result);
+      } catch (err) {
+        console.error("Primary Ollama runner failed, executing fallback...", err.message);
+      }
+    }
+  }
+
+  try {
+    const fallbackResult = await callPollinationsFallback(messages || prompt);
+    return res.json(fallbackResult);
+  } catch (fallbackErr) {
+    return res.status(500).json({ error: "All AI layers failed execution", details: fallbackErr.message });
+  }
 });
-app.post("/ask/json", verifyDynamicHmac, async (req, res) => {
-const body = req.body;
-const fallbackPrompt = body.prompt || body.messages?.[0]?.content;
-if (!checkRateLimit(req.deviceId)) {
-console.log(⚠️ Rate monitoring threshold breached for ${req.deviceId}. Forcing offload channel.);
-try {
-const fallbackData = await callPollinationsFallback(fallbackPrompt);
-return res.json(fallbackData);
-} catch (err) {
-return res.status(429).json({ error: "Rate thresholds surpassed, backup pipeline failed." });
-}
-}
-if (!fallbackPrompt) return res.status(400).json({ error: "Explicit prompt text or array required" });
-const ollamaRequest = {
-model: body.model || MODEL_NAME,
-prompt: fallbackPrompt,
-format: "json",
-stream: false,
-temperature: body.temperature ?? 0.25,
-...(body.response_format ? { response_format: body.response_format } : {}),
-};
-try {
-const data = await processRequest(ollamaRequest, "json", fallbackPrompt);
-res.json(data);
-} catch (err) {
-try {
-const fallbackData = await callPollinationsFallback(fallbackPrompt);
-res.json(fallbackData);
-} catch (fallbackErr) {
-res.status(503).json({ error: err.message });
-}
-}
+
+app.get("/api/instance/status", verifyDynamicHmac, async (req, res) => {
+  const instanceName = deriveInstanceName(req.deviceId);
+  try {
+    // FIXED: Added backticks for template literal
+    const evoResponse = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/connectionState/${instanceName}`, {
+      method: "GET",
+      headers: { "apikey": req.deviceToken },
+    });
+    const data = await evoResponse.json();
+    return res.status(evoResponse.status).json(data);
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to pull state connection", details: err.message });
+  }
 });
-app.listen(PORT, () => console.log(🌐 Secure Hexabiz-AI Service running on port ${PORT}));
-}
-startServer();
+
+// --- INITIALIZATION ---
+const server = app.listen(PORT, async () => {
+  // FIXED: Added backticks for template literals
+  console.log(`Proxy system active and listening on port ${PORT}`);
+  
+  if (AI_PROVIDER === "ollama") {
+    console.log(`Verifying target model allocations: [${MODEL_NAME}] across runners...`);
+    for (const runner of RUNNERS) {
+      try {
+        await waitForRunner(runner);
+        console.log(`Runner ready: ${runner.url}`);
+      } catch (err) {
+        console.error(`Runner diagnostic alert: ${err.message}`);
+      }
+    }
+  }
+});
