@@ -16,10 +16,13 @@ COPY . .
 # Expose the port your server listens on
 EXPOSE 3000
 
-# Set environment defaults for container runtime (optional, can override in docker-compose)
+# Set environment defaults (These are safely overridden by docker-compose.yml)
 ENV PORT=3000
-ENV OLLAMA_HOST=http://ollama:11434
+# CRITICAL FIX: Match the variable name your Node.js code actually reads
+ENV OLLAMA_RUNNERS=http://ollama:11434
 ENV OLLAMA_DEFAULT_MODEL=gemma:2b
 
-# Start the server
-CMD ["node", "oscillation-layer.js"]
+# CRITICAL FIX: Ensure this matches your ACTUAL JavaScript filename
+# If your file is named oscillation-layer.js, change it back. 
+# Based on your directory tree, it should be hexabiz-gateway.js
+CMD ["node", "hexabiz-gateway.js"]
