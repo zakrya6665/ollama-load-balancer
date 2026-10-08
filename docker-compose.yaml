@@ -1,53 +1,59 @@
-version: "3.9"
-
 services:
   ollama:
     image: ollama/ollama:latest
-    container_name: ollama
     restart: always
-    volumes:
-      - ollama-config:/root/.ollama/config
-      - ollama-models:/root/.ollama/models
-    command: serve
-    environment:
-      OLLAMA_DEFAULT_MODEL: "gemma:2b"
-      OLLAMA_MAX_LOADED_MODELS: 1
-      OLLAMA_CONTEXT_LENGTH: 1024
-      OLLAMA_NUM_THREADS: 8
-      OLLAMA_USE_MMAP: "true"
-      OLLAMA_USE_MLOCK: "false"
-      OLLAMA_LOW_VRAM: "true"
-      OLLAMA_VULKAN: 0
-      OLLAMA_GPU_OVERHEAD: 0
     ports:
-      - "11434:11434"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 180s   # Wait 3 minutes for Gemma to load on 8GB RAM
+      - "11434:11434" # Expose only if needed externally
+    volumes:
+      - ollama-data:/root/.ollama
+    # Pre-pull the model on startup to ensure it's ready when the gateway checks for it
+    command: sh -c "ollama pull gemma:2b && ollama serve"
 
   oscillation-layer:
     build:
-      context: ./oscillation-layer
-    container_name: oscillation-layer
+      context: ./hexabiz-gateway # Ensure this path matches your actual project directory
     restart: always
     ports:
       - "3000:3000"
     environment:
+      # ============================================================
+      # Core Configuration
+      # ============================================================
       PORT: 3000
-      OLLAMA_HOST: http://ollama:11434
-      OLLAMA_DEFAULT_MODEL: '${OLLAMA_DEFAULT_MODEL:-ordexa-gemma}'
+      OLLAMA_DEFAULT_MODEL: "gemma:2b"
+      OLLAMA_RUNNERS: "http://ollama:11434"
+
+      # ============================================================
+      # Evolution API Integration
+      # ============================================================
+      EVOLUTION_SERVER_URL: "http://evolution-api:8080" # Update if your evolution-api service name/port differs
+      EVOLUTION_GLOBAL_KEY: "your_evolution_global_key_here" # ⚠️ REQUIRED: Replace with your actual Evolution API global key
+
+      # ============================================================
+      # App Security
+      # ============================================================
+      APP_ENROLLMENT_KEY: "your_app_enrollment_key_here" # ⚠️ REQUIRED: Replace with a strong, random secret string
+
+      # ============================================================
+      # AI Provider & Fallback Configuration
+      # ============================================================
+      AI_PROVIDER: "ollama"
+      FALLBACK_MODEL: "openai/gpt-5.4-nano"
+      POLLINATIONS_BASE_URL: "https://text.pollinations.ai"
+      POLLINATIONS_API_KEY: "your_pollinations_api_key_here" # Required if the Ollama fallback is triggered
+
+      # ============================================================
+      # Rate Limiting & Security Tuning (Matches code defaults)
+      # ============================================================
+      MAX_QUEUE_SIZE: 50
+      RATE_LIMIT_WINDOW_MS: 60000
+      MAX_REQUESTS_PER_WINDOW: 20
+      HMAC_MAX_SKEW_SECONDS: 60
+      OUTBOUND_TIMEOUT_MS: 120000
+      MAX_PROMPT_LENGTH: 12000
+
     depends_on:
       - ollama
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
-
 volumes:
-  ollama-config:
-  ollama-models:
+  ollama-data:
+  # evolution-data: # Uncomment if you add the evolution-api service above
