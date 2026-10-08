@@ -9,9 +9,9 @@ services:
     # Pre-pull the model on startup to ensure it's ready when the gateway checks for it
     command: sh -c "ollama pull gemma:2b && ollama serve"
 
-  oscillation-layer:
+  hexabiz-gateway:
     build:
-      context: .  # <--- CHANGED: Points to the root directory where your Dockerfile and package.json are located
+      context: ./hexabiz-gateway  # <--- CHANGED: Points to the root directory where your Dockerfile and package.json are located
     restart: always
     ports:
       - "3000:3000"
