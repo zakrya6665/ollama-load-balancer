@@ -3,48 +3,38 @@ services:
     image: ollama/ollama:latest
     restart: always
     ports:
-      - "11434:11434" # Expose only if needed externally
+      - "11434:11434"
     volumes:
       - ollama-data:/root/.ollama
     # Pre-pull the model on startup to ensure it's ready when the gateway checks for it
     command: sh -c "ollama pull gemma:2b && ollama serve"
 
-  hexabiz-gateway:
+  oscillation-layer:
     build:
-      context: ./oscillation-layer # Ensure this path matches your actual project directory
+      context: .  # <--- CHANGED: Points to the root directory where your Dockerfile and package.json are located
     restart: always
     ports:
       - "3000:3000"
     environment:
-      # ============================================================
       # Core Configuration
-      # ============================================================
       PORT: 3000
       OLLAMA_DEFAULT_MODEL: "gemma:2b"
       OLLAMA_RUNNERS: "http://ollama:11434"
 
-      # ============================================================
       # Evolution API Integration
-      # ============================================================
-      EVOLUTION_SERVER_URL: "http://evolution-api:8080" # Update if your evolution-api service name/port differs
-      EVOLUTION_GLOBAL_KEY: "your_evolution_global_key_here" # ⚠️ REQUIRED: Replace with your actual Evolution API global key
+      EVOLUTION_SERVER_URL: "http://evolution-api:8080"
+      EVOLUTION_GLOBAL_KEY: "${EVOLUTION_GLOBAL_KEY}" # Coolify will inject this from your Environment Variables
 
-      # ============================================================
       # App Security
-      # ============================================================
-      APP_ENROLLMENT_KEY: "your_app_enrollment_key_here" # ⚠️ REQUIRED: Replace with a strong, random secret string
+      APP_ENROLLMENT_KEY: "${APP_ENROLLMENT_KEY}" # Coolify will inject this
 
-      # ============================================================
       # AI Provider & Fallback Configuration
-      # ============================================================
       AI_PROVIDER: "ollama"
       FALLBACK_MODEL: "openai/gpt-5.4-nano"
       POLLINATIONS_BASE_URL: "https://text.pollinations.ai"
-      POLLINATIONS_API_KEY: "your_pollinations_api_key_here" # Required if the Ollama fallback is triggered
+      POLLINATIONS_API_KEY: "${POLLINATIONS_API_KEY}"
 
-      # ============================================================
-      # Rate Limiting & Security Tuning (Matches code defaults)
-      # ============================================================
+      # Rate Limiting & Security Tuning
       MAX_QUEUE_SIZE: 50
       RATE_LIMIT_WINDOW_MS: 60000
       MAX_REQUESTS_PER_WINDOW: 20
@@ -54,6 +44,6 @@ services:
 
     depends_on:
       - ollama
+
 volumes:
   ollama-data:
-  # evolution-data: # Uncomment if you add the evolution-api service above
