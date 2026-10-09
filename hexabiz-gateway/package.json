@@ -1,14 +1,15 @@
 {
-  "name": "oscillation-layer",
+  "name": "ollama-load-balancer",
   "version": "1.0.0",
-  "main": "oscillation-layer.js",
+  "description": "Ollama load balancer and API gateway",
+  "main": "hexabiz-gateway.js",
   "type": "module",
   "scripts": {
-    "start": "node oscillation-layer.js"
+    "start": "node hexabiz-gateway.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "node-fetch": "^3.3.2",
-    "p-queue": "^7.3.0"
+    "helmet": "^7.1.0",
+    "node-fetch": "^3.3.2"
   }
 }
