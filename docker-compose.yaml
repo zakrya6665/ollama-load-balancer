@@ -20,6 +20,8 @@ services:
     build:
       context: ./hexabiz-gateway  # <--- CHANGED: Points to the root directory where your Dockerfile and package.json are located
     restart: always
+    networks:
+      - HexaSynq
     ports:
       - "3000:3000"
     environment:
@@ -50,7 +52,13 @@ services:
       MAX_PROMPT_LENGTH: 12000
 
     depends_on:
-      - ollama
-
+      ollama:
+        condition: service_healthy
+          
+networks:
+  HexaSynq:
+    external: true
+    name: HexaSynq
 volumes:
   ollama-data:
+
