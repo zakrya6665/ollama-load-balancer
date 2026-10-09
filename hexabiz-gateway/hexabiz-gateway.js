@@ -279,6 +279,7 @@ app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 
 // --- TIER 1: HIGH VALUE ADMIN OPERATIONS ---
+// --- TIER 1: HIGH VALUE ADMIN OPERATIONS ---
 app.post(
   "/api/instance/create",
   strictIpRateLimit,          // 1. Strict IP check (Max 3 per 24h)
@@ -292,25 +293,32 @@ app.post(
     }
 
     const instanceName = deriveInstanceName(deviceId);
-    const token = deriveDeviceSecret(deviceId);
+    
+    // ⚠️ CRITICAL: Derive the secret on the server using the hidden GLOBAL_KEY
+    const deviceSecret = deriveDeviceSecret(deviceId);
 
     try {
-      // FIXED: Added backticks for template literal
       const evoResponse = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/create`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "apikey": EVOLUTION_GLOBAL_KEY,
+          "apikey": EVOLUTION_GLOBAL_KEY, // Safe: Only the server knows this
         },
         body: JSON.stringify({
           instanceName: instanceName,
-          token: token,
+          token: deviceSecret, // Sent to Evolution API
           qrcode: true,
         }),
       });
 
       const data = await evoResponse.json();
-      return res.status(evoResponse.status).json(data);
+      
+      // ⚠️ CRITICAL FIX: Return the deviceSecret to the Android app 
+      // so it can store it and use it to sign future /api/chat requests!
+      return res.status(evoResponse.status).json({
+        ...data,
+        deviceSecret: deviceSecret, 
+      });
     } catch (err) {
       return res.status(500).json({ error: "Evolution API context error", details: err.message });
     }
