@@ -2,13 +2,20 @@ services:
   ollama:
     image: ollama/ollama:latest
     restart: always
-    ports:
-      - "11434:11434"
     volumes:
       - ollama-data:/root/.ollama
-    # Pre-pull the model on startup to ensure it's ready when the gateway checks for it
-    command: sh -c "ollama pull gemma:2b && ollama serve"
-
+    # Use Ollama's normal entrypoint.
+    # Start the server first; pull the model after it is ready.
+    command:
+      - serve
+    networks:
+      - HexaSynq
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
   hexabiz-gateway:
     build:
       context: ./hexabiz-gateway  # <--- CHANGED: Points to the root directory where your Dockerfile and package.json are located
