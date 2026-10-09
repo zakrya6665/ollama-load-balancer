@@ -31,7 +31,7 @@ services:
       OLLAMA_RUNNERS: "http://ollama:11434"
 
       # Evolution API Integration
-      EVOLUTION_SERVER_URL: "http://evolution-api:8080"
+      EVOLUTION_SERVER_URL: "http://whatsapp_api:8080"
       EVOLUTION_GLOBAL_KEY: "${EVOLUTION_GLOBAL_KEY}" # Coolify will inject this from your Environment Variables
 
       # App Security
