@@ -132,10 +132,8 @@ function verifyEnrollmentKey(req, res, next) {
 
 // STRICT IP RATE LIMITER FOR INSTANCE CREATION
 function strictIpRateLimit(req, res, next) {
-  // Extract real IP, accounting for Coolify/Nginx reverse proxy
-  const ip = req.headers['x-forwarded-for'] 
-    ? req.headers['x-forwarded-for'].split(',')[0].trim() 
-    : (req.ip || req.connection.remoteAddress);
+  // With "trust proxy" set, req.ip is the real client IP and can't be spoofed via X-Forwarded-For
+  const ip = (req.ip || req.socket.remoteAddress || "").replace(/^::ffff:/, "");
 
   if (!isValidIP(ip)) {
     console.warn(`[SECURITY] Invalid IP format attempted instance creation: ${ip}`);
@@ -143,22 +141,29 @@ function strictIpRateLimit(req, res, next) {
   }
 
   const now = Date.now();
-  const existing = instanceCreationLimits.get(ip);
-  const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+  const WINDOW_MS = 24 * 60 * 60 * 1000;
+  const LIMIT = 3;
 
-  if (!existing || (now - existing.windowStart) > TWENTY_FOUR_HOURS_MS) {
-    instanceCreationLimits.set(ip, { count: 1, windowStart: now });
-    return next();
+  let entry = instanceCreationLimits.get(ip);
+  if (!entry || now - entry.windowStart > WINDOW_MS) {
+    entry = { count: 0, windowStart: now };
+    instanceCreationLimits.set(ip, entry);
   }
 
-  if (existing.count >= 3) {
-    console.warn(`[SECURITY] IP ${ip} exceeded strict instance creation limit (3/24h).`);
-    return res.status(429).json({ 
-      error: "Strict limit reached: Maximum 3 device linkings allowed per 24 hours from this network." 
+  if (entry.count >= LIMIT) {
+    console.warn(`[SECURITY] IP ${ip} exceeded strict instance creation limit (${LIMIT}/24h).`);
+    return res.status(429).json({
+      error: "Strict limit reached: Maximum 3 device linkings allowed per 24 hours from this network.",
     });
   }
 
-  existing.count += 1;
+  entry.count += 1;
+
+  // Give the attempt back if the request fails (bad device ID, Evolution error, etc.)
+  res.on("finish", () => {
+    if (res.statusCode >= 400 && entry.count > 0) entry.count -= 1;
+  });
+
   next();
 }
 
@@ -275,6 +280,7 @@ async function getAvailableRunner() {
 // ============================================================
 
 const app = express();
+app.set("trust proxy", 1);
 app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 
@@ -282,8 +288,9 @@ app.use(express.json({ limit: "2mb" }));
 // --- TIER 1: HIGH VALUE ADMIN OPERATIONS ---
 app.post(
   "/api/instance/create",
-  strictIpRateLimit,          // 1. Strict IP check (Max 3 per 24h)
-  verifyEnrollmentKey,        // 2. App enrollment key check
+  
+  verifyEnrollmentKey,        // 1. App enrollment key check
+  strictIpRateLimit,          // 2. Strict IP check (Max 3 per 24h)
   verifyPlayIntegrityToken,   // 3. Optional Google Play Integrity check
   async (req, res) => {
     const { deviceId } = req.body;
@@ -308,6 +315,7 @@ app.post(
           instanceName: instanceName,
           token: deviceSecret, // Sent to Evolution API
           qrcode: true,
+          integration: "WHATSAPP-BAILEYS",
         }),
       });
 
