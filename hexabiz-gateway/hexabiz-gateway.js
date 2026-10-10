@@ -782,11 +782,17 @@ const server = app.listen(PORT, async () => {
   console.log(`Proxy system active and listening on port ${PORT}`);
 
   // Initialize Firebase Admin
+// --- INITIALIZATION ---
+const server = app.listen(PORT, async () => {
+  console.log(`Proxy system active and listening on port ${PORT}`);
+
+  // Initialize Firebase Admin via File Path
   try {
+    const firebasePath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "./serviceAccountKey.json";
     admin.initializeApp({
-      credential: admin.credential.cert(process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "./serviceAccountKey.json")
+      credential: admin.credential.cert(firebasePath)
     });
-    console.log("[FCM] Firebase Admin initialized successfully.");
+    console.log(`[FCM] Firebase Admin initialized successfully using: ${firebasePath}`);
   } catch (err) {
     console.error("[FCM] Failed to initialize Firebase Admin. FCM pushes will fail.", err.message);
   }
