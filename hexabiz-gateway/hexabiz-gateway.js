@@ -426,7 +426,7 @@ async function sendFcmData(instanceName, dataPayload) {
   const data = Object.fromEntries(Object.entries(dataPayload).map(([k, v]) => [k, String(v ?? "")]));
 
   try {
-    await admin.messaging().send({
+      await getMessaging().send({
       token: fcmToken,
       data,
       android: { priority: "high" },
