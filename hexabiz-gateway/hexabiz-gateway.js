@@ -2,7 +2,8 @@ import express from "express";
 import helmet from "helmet";
 import fetch from "node-fetch";
 import crypto from "crypto";
-import * as admin from "firebase-admin"; // FCM Admin SDK
+import { initializeApp, cert } from "firebase-admin/app";
+import { getMessaging } from "firebase-admin/messaging";
 
 // ============================================================
 // Configuration
@@ -782,14 +783,13 @@ setInterval(() => {
 const server = app.listen(PORT, async () => {
   console.log(`Proxy system active and listening on port ${PORT}`);
 
-  // Initialize Firebase Admin
+  // Initialize Firebase Admin using Modular API
   try {
-    // Fallback to the exact mounted path if the env var is somehow missing
     const firebasePath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "/run/secrets/serviceAccountKey.json";
     console.log(`[FCM] Attempting to load Firebase config from: ${firebasePath}`);
     
-    admin.initializeApp({
-      credential: admin.credential.cert(firebasePath)
+    initializeApp({
+      credential: cert(firebasePath)
     });
     console.log("[FCM] ✅ Firebase Admin initialized successfully.");
   } catch (err) {
