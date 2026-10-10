@@ -27,7 +27,7 @@ services:
     environment:
       # Core Configuration
       PORT: 3000
-      OLLAMA_DEFAULT_MODEL: "gemma:2b"
+      OLLAMA_DEFAULT_MODEL: "synq:latest"
       OLLAMA_RUNNERS: "http://ollama:11434"
 
       # Evolution API Integration
@@ -40,7 +40,7 @@ services:
       # AI Provider & Fallback Configuration
       AI_PROVIDER: "ollama"
       FALLBACK_MODEL: "openai/gpt-5.4-nano"
-      POLLINATIONS_BASE_URL: "https://text.pollinations.ai"
+      POLLINATIONS_BASE_URL: "https://gen.pollinations.ai"
       POLLINATIONS_API_KEY: "${POLLINATIONS_API_KEY}"
 
       # Rate Limiting & Security Tuning
