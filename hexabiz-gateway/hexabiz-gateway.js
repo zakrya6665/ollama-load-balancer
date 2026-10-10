@@ -781,11 +781,6 @@ setInterval(() => {
 const server = app.listen(PORT, async () => {
   console.log(`Proxy system active and listening on port ${PORT}`);
 
-  // Initialize Firebase Admin
-// --- INITIALIZATION ---
-const server = app.listen(PORT, async () => {
-  console.log(`Proxy system active and listening on port ${PORT}`);
-
   // Initialize Firebase Admin via File Path
   try {
     const firebasePath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "./serviceAccountKey.json";
