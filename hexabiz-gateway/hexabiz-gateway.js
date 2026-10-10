@@ -2,7 +2,7 @@ import express from "express";
 import helmet from "helmet";
 import fetch from "node-fetch";
 import crypto from "crypto";
-import admin from "firebase-admin"; // FCM Admin SDK
+import * as admin from "firebase-admin"; // FCM Admin SDK
 
 // ============================================================
 // Configuration
@@ -777,19 +777,23 @@ setInterval(() => {
   console.log(`[CLEANUP] Pruned expired rate limit and nonce entries.`);
 }, CLEANUP_INTERVAL_MS);
 
+
 // --- INITIALIZATION ---
 const server = app.listen(PORT, async () => {
   console.log(`Proxy system active and listening on port ${PORT}`);
 
-  // Initialize Firebase Admin via File Path
+  // Initialize Firebase Admin
   try {
-    const firebasePath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "./serviceAccountKey.json";
+    // Fallback to the exact mounted path if the env var is somehow missing
+    const firebasePath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "/run/secrets/serviceAccountKey.json";
+    console.log(`[FCM] Attempting to load Firebase config from: ${firebasePath}`);
+    
     admin.initializeApp({
       credential: admin.credential.cert(firebasePath)
     });
-    console.log(`[FCM] Firebase Admin initialized successfully using: ${firebasePath}`);
+    console.log("[FCM] ✅ Firebase Admin initialized successfully.");
   } catch (err) {
-    console.error("[FCM] Failed to initialize Firebase Admin. FCM pushes will fail.", err.message);
+    console.error("[FCM] ❌ Failed to initialize Firebase Admin. FCM pushes will fail.", err.message);
   }
 
   if (AI_PROVIDER === "ollama") {
