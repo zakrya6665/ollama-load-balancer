@@ -31,6 +31,9 @@ const HMAC_MAX_SKEW_SECONDS = positiveInt(process.env.HMAC_MAX_SKEW_SECONDS, 60)
 const OUTBOUND_TIMEOUT_MS = positiveInt(process.env.OUTBOUND_TIMEOUT_MS, 120_000);
 const MAX_PROMPT_LENGTH = positiveInt(process.env.MAX_PROMPT_LENGTH, 12_000);
 
+// Successful instance creations allowed per IP per 24h. Raise it while testing, set back to 3 for release.
+const INSTANCE_CREATE_LIMIT = positiveInt(process.env.INSTANCE_CREATE_LIMIT, 3);
+
 const RUNNERS = (process.env.OLLAMA_RUNNERS || "http://ollama:11434")
   .split(",")
   .map((value) => value.trim().replace(/\/+$/, ""))
@@ -43,7 +46,7 @@ if (!EVOLUTION_GLOBAL_KEY || !APP_ENROLLMENT_KEY) {
   process.exit(1);
 }
 
-console.log("[CONFIG] Evolution Server URL:", EVOLUTION_SERVER_URL);
+console.log("[CONFIG] Evolution Server URL:", safeUrl(EVOLUTION_SERVER_URL));
 console.log("[CONFIG] Gateway Public URL:", GATEWAY_PUBLIC_URL);
 console.log("[CONFIG] AI Provider:", AI_PROVIDER);
 
@@ -70,6 +73,10 @@ const WEBHOOK_EVENTS = [
 
 const MAX_FCM_TEXT = 1500; // FCM data payloads are capped at 4 KB total
 
+// ============================================================
+// Small helpers
+// ============================================================
+
 function positiveInt(value, fallback) {
   const parsed = Number.parseInt(value ?? "", 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -77,6 +84,18 @@ function positiveInt(value, fallback) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Strips any user:password from a URL before it is logged. */
+function safeUrl(value) {
+  try {
+    const u = new URL(value);
+    u.username = "";
+    u.password = "";
+    return u.toString().replace(/\/$/, "");
+  } catch {
+    return "[invalid url]";
+  }
 }
 
 function safeEqualText(a, b) {
@@ -187,8 +206,9 @@ function unregisterInstance(instanceName, deviceId) {
 // Evolution helpers
 // ============================================================
 
+// NOTE: this builds the config only. Never log it: it contains the webhook secret.
 function buildWebhookConfig() {
-  const config = {
+  return {
     enabled: true,
     url: `${GATEWAY_PUBLIC_URL}/webhook/evolution?s=${WEBHOOK_SECRET}`,
     byEvents: false,
@@ -196,24 +216,19 @@ function buildWebhookConfig() {
     headers: { "x-webhook-secret": WEBHOOK_SECRET },
     events: WEBHOOK_EVENTS,
   };
-  console.log(`[WEBHOOK] Configured webhook URL: ${config.url}`);
-  return config;
 }
 
 /** true = exists, false = does not exist, null = could not tell. Uses the global key. */
 async function instanceExists(instanceName) {
   try {
-    console.log(`[EVOLUTION] Checking if instance exists: ${instanceName}`);
     const r = await fetchWithTimeout(
       `${EVOLUTION_SERVER_URL}/instance/fetchInstances?instanceName=${encodeURIComponent(instanceName)}`,
       { method: "GET", headers: { apikey: EVOLUTION_GLOBAL_KEY } }
     );
-    console.log(`[EVOLUTION] fetchInstances status: ${r.status}`);
     if (r.status === 404) return false;
     if (!r.ok) return null;
     const body = await r.json().catch(() => null);
     const list = Array.isArray(body) ? body : body ? [body] : [];
-    console.log(`[EVOLUTION] Instance ${instanceName} exists: ${list.length > 0}`);
     return list.length > 0;
   } catch (err) {
     console.error(`[EVOLUTION] Error checking instance existence: ${err.message}`);
@@ -228,12 +243,10 @@ async function instanceExists(instanceName) {
  */
 async function instanceAccess(instanceName, deviceSecret) {
   try {
-    console.log(`[EVOLUTION] Checking instance access: ${instanceName}`);
     const r = await fetchWithTimeout(
       `${EVOLUTION_SERVER_URL}/instance/connectionState/${encodeURIComponent(instanceName)}`,
       { method: "GET", headers: { apikey: deviceSecret } }
     );
-    console.log(`[EVOLUTION] connectionState status: ${r.status}`);
     if (r.ok) return "owned";
     const exists = await instanceExists(instanceName);
     if (exists === false) return "missing";
@@ -245,25 +258,64 @@ async function instanceAccess(instanceName, deviceSecret) {
   }
 }
 
+/** "open" | "connecting" | "close" | null (unknown). Uses the instance's own key. */
+async function getInstanceState(instanceName, deviceSecret) {
+  try {
+    const r = await fetchWithTimeout(
+      `${EVOLUTION_SERVER_URL}/instance/connectionState/${encodeURIComponent(instanceName)}`,
+      { method: "GET", headers: { apikey: deviceSecret } }
+    );
+    if (!r.ok) return null;
+    const d = await r.json().catch(() => null);
+    return d?.instance?.state ?? d?.state ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Asks Evolution for a pairing code: GET /instance/connect/{name}?number=...
+ * - Works from the "close" state. A socket stuck in "connecting" ignores the number and only
+ *   returns a cached QR, so after the first miss the instance is logged out once and retried.
+ * - Returns the code string, or null. The app falls back to its own connect call when null.
+ */
+async function fetchPairingCode(instanceName, deviceSecret, phone) {
+  const url = `${EVOLUTION_SERVER_URL}/instance/connect/${encodeURIComponent(instanceName)}?number=${phone}`;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await sleep(attempt === 1 ? 1500 : 3000);
+    try {
+      const r = await fetchWithTimeout(url, { method: "GET", headers: { apikey: deviceSecret } });
+      const d = await r.json().catch(() => ({}));
+      const code = d?.pairingCode ?? d?.qrcode?.pairingCode ?? null;
+      console.log(`[PAIRING] ${instanceName} attempt ${attempt}: http=${r.status} code=${code ? "present" : "absent"}`);
+      if (code) return code;
+    } catch (err) {
+      console.warn(`[PAIRING] ${instanceName} attempt ${attempt} failed: ${err.message}`);
+    }
+    if (attempt === 1) {
+      try {
+        await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/logout/${encodeURIComponent(instanceName)}`, {
+          method: "DELETE",
+          headers: { apikey: EVOLUTION_GLOBAL_KEY },
+        });
+      } catch { /* best effort */ }
+    }
+  }
+  return null;
+}
+
 /** Best effort: (re)attach the webhook to an existing instance. Needs Evolution v2 /webhook/set. */
 async function configureWebhook(instanceName) {
   try {
-    console.log(`[WEBHOOK] Attempting to configure webhook for: ${instanceName}`);
-    const webhookConfig = buildWebhookConfig();
-    console.log(`[WEBHOOK] Sending config to Evolution:`, JSON.stringify(webhookConfig, null, 2));
-    
     const r = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/webhook/set/${encodeURIComponent(instanceName)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", apikey: EVOLUTION_GLOBAL_KEY },
-      body: JSON.stringify({ webhook: webhookConfig }),
+      body: JSON.stringify({ webhook: buildWebhookConfig() }),
     });
-    
-    console.log(`[WEBHOOK] webhook/set response status: ${r.status}`);
     if (!r.ok) {
-      const errorText = await r.text();
-      console.warn(`[WEBHOOK] webhook/set for ${instanceName} returned HTTP ${r.status}: ${errorText}`);
+      console.warn(`[WEBHOOK] webhook/set for ${instanceName} returned HTTP ${r.status}`);
     } else {
-      console.log(`[WEBHOOK] Successfully configured webhook for ${instanceName}`);
+      console.log(`[WEBHOOK] Webhook configured for ${instanceName}`);
     }
   } catch (err) {
     console.error(`[WEBHOOK] webhook/set for ${instanceName} failed: ${err.message}`);
@@ -273,18 +325,8 @@ async function configureWebhook(instanceName) {
 /** Instance name for a signed request. Header first, then known mapping, then the old hash name. */
 function resolveInstanceName(req) {
   const header = req.get("x-instance-name");
-  if (header) {
-    console.log(`[INSTANCE] Using instance name from header: ${header}`);
-    return isValidInstanceName(header) ? header : null;
-  }
-  const mapped = deviceToInstanceMap.get(req.deviceId);
-  if (mapped) {
-    console.log(`[INSTANCE] Using instance name from mapping: ${mapped}`);
-    return mapped;
-  }
-  const legacy = deriveLegacyInstanceName(req.deviceId);
-  console.log(`[INSTANCE] Using legacy instance name: ${legacy}`);
-  return legacy;
+  if (header) return isValidInstanceName(header) ? header : null;
+  return deviceToInstanceMap.get(req.deviceId) || deriveLegacyInstanceName(req.deviceId);
 }
 
 // ============================================================
@@ -294,10 +336,12 @@ function resolveInstanceName(req) {
 function verifyEnrollmentKey(req, res, next) {
   const supplied = req.get("x-enrollment-key");
   if (!supplied || !safeEqualText(supplied, APP_ENROLLMENT_KEY)) {
-    console.warn(`[SECURITY] Invalid enrollment key from IP: ${req.ip}`);
+    // Lengths only (never the key). A difference of 1-2 usually means a stray space, newline or quote.
+    console.warn(
+      `[SECURITY] Enrollment key rejected from ${req.ip} (supplied length=${supplied ? supplied.length : 0}, expected length=${APP_ENROLLMENT_KEY.length})`
+    );
     return res.status(401).json({ error: "Unauthorized" });
   }
-  console.log(`[SECURITY] Enrollment key verified`);
   next();
 }
 
@@ -309,18 +353,18 @@ function strictIpRateLimit(req, res, next) {
   }
   const now = Date.now();
   const WINDOW_MS = 24 * 60 * 60 * 1000;
-  const LIMIT = 3;
   let entry = instanceCreationLimits.get(ip);
   if (!entry || now - entry.windowStart > WINDOW_MS) {
     entry = { count: 0, windowStart: now };
     instanceCreationLimits.set(ip, entry);
   }
-  if (entry.count >= LIMIT) {
-    console.warn(`[SECURITY] IP ${ip} exceeded strict instance creation limit (${LIMIT}/24h).`);
-    return res.status(429).json({ error: "Strict limit reached: Maximum 3 device linkings allowed per 24 hours." });
+  if (entry.count >= INSTANCE_CREATE_LIMIT) {
+    console.warn(`[SECURITY] IP ${ip} exceeded instance creation limit (${INSTANCE_CREATE_LIMIT}/24h).`);
+    return res.status(429).json({
+      error: `Strict limit reached: Maximum ${INSTANCE_CREATE_LIMIT} device linkings allowed per 24 hours.`,
+    });
   }
   entry.count += 1;
-  console.log(`[SECURITY] IP ${ip} instance creation count: ${entry.count}/${LIMIT}`);
   res.on("finish", () => {
     if (res.statusCode >= 400 && entry.count > 0) entry.count -= 1;
   });
@@ -359,7 +403,7 @@ function verifyDynamicHmac(req, res, next) {
   }
 
   if (!consumeNonce(`${deviceId}:${nonce}`, Date.now())) {
-    console.warn(`[SECURITY] Replay detected for device: ${deviceId}, nonce: ${nonce}`);
+    console.warn(`[SECURITY] Replay detected for device: ${deviceId}`);
     return res.status(401).json({ error: "Replay detected" });
   }
 
@@ -370,7 +414,6 @@ function verifyDynamicHmac(req, res, next) {
 
   req.deviceId = deviceId;
   req.deviceToken = deviceSecret;
-  console.log(`[SECURITY] HMAC verified for device: ${deviceId}`);
   next();
 }
 
@@ -432,7 +475,7 @@ async function waitForRunner(runner) {
     } catch { /* Retry */ }
     await sleep(3000);
   }
-  throw new Error(`Ollama runner ${runner.url} did not expose model ${MODEL_NAME}`);
+  throw new Error(`Ollama runner ${safeUrl(runner.url)} did not expose model ${MODEL_NAME}`);
 }
 
 async function sendToRunner(runner, ollamaRequest, endpointType) {
@@ -472,12 +515,12 @@ async function sendFcmData(instanceName, dataPayload) {
   const data = Object.fromEntries(Object.entries(dataPayload).map(([k, v]) => [k, String(v ?? "")]));
 
   try {
-      await getMessaging().send({
+    await getMessaging().send({
       token: fcmToken,
       data,
       android: { priority: "high" },
     });
-    console.log(`[FCM] ✅ Successfully pushed to device ${deviceId} for instance ${instanceName}`);
+    console.log(`[FCM] ✅ Pushed ${data.type || "data"} to device ${deviceId}`);
   } catch (fcmError) {
     console.error(`[FCM] ❌ Failed to send to ${deviceId}:`, fcmError.message);
     if (fcmError.code === "messaging/invalid-registration-token" || fcmError.code === "messaging/registration-token-not-registered") {
@@ -510,60 +553,37 @@ app.post(
   strictIpRateLimit,
   verifyPlayIntegrityToken,
   async (req, res) => {
-    console.log("\n========== [CREATE INSTANCE] START ==========");
-    console.log(`[CREATE] Request from IP: ${req.ip}`);
-    console.log(`[CREATE] Request body:`, JSON.stringify(req.body, null, 2));
-    
-    // Accept 'usePairingCode' flag from Android app (defaults to false)
-    const { deviceId, usePairingCode } = req.body ?? {};
-    
+    const { deviceId } = req.body ?? {};
+    // The Android app sets this to true when the user chose "Pairing Code" (QR users leave it out).
+    const wantsPairing = req.body?.usePairingCode === true;
+
     if (!isValidDeviceId(deviceId)) {
-      console.error(`[CREATE] Invalid device ID: ${deviceId}`);
       return res.status(400).json({ error: "Invalid device ID assignment" });
     }
-    console.log(`[CREATE] ✅ Valid device ID: ${deviceId}`);
-
     const phone = normalizePhone(req.body?.phoneNumber);
     if (!phone) {
-      console.error(`[CREATE] ❌ Invalid phone number: ${req.body?.phoneNumber}`);
       return res.status(400).json({ error: "Invalid phone number. Use country code + number, 8 to 15 digits." });
     }
-    console.log(`[CREATE] ✅ Normalized phone: ${phone}`);
 
     const instanceName = deriveInstanceName(phone); // dev_<number>
-    console.log(`[CREATE] Derived instance name: ${instanceName}`);
-    
     const deviceSecret = deriveDeviceSecret(deviceId);
-    console.log(`[CREATE] Generated device secret (first 8 chars): ${deviceSecret.slice(0, 8)}...`);
+    console.log(`[CREATE] instance=${instanceName} device=${deviceId} mode=${wantsPairing ? "pairing" : "qr"}`);
 
-    const webhookConfig = buildWebhookConfig();
-    console.log(`[CREATE] Webhook config:`, JSON.stringify(webhookConfig, null, 2));
-
-    // DEFAULT to QR Code, but allow Pairing Code if explicitly requested by the Android app
+    // qrcode:true makes Evolution open the socket. With "number" present it also returns a
+    // pairingCode (inside data.qrcode). Without "number" you get the QR only.
     const requestBody = {
       instanceName,
       token: deviceSecret,
-      qrcode: !usePairingCode, // true for QR (default), false for Pairing Code
+      qrcode: true,
       integration: "WHATSAPP-BAILEYS",
       groupsIgnore: true,
       alwaysOnline: false,
       readMessages: false,
       readStatus: false,
       rejectCall: false,
-      webhook: webhookConfig,
+      webhook: buildWebhookConfig(),
     };
-
-    // If pairing code is requested, pass the number to Evolution API
-    if (usePairingCode) {
-      requestBody.number = phone;
-      console.log(`[CREATE] Mode: Pairing Code (number provided to Evolution)`);
-    } else {
-      console.log(`[CREATE] Mode: QR Code (default)`);
-    }
-
-    console.log(`[CREATE] Sending to Evolution:`);
-    console.log(`[CREATE]   URL: ${EVOLUTION_SERVER_URL}/instance/create`);
-    console.log(`[CREATE]   Body:`, JSON.stringify(requestBody, null, 2));
+    if (wantsPairing) requestBody.number = phone;
 
     try {
       const evoResponse = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/create`, {
@@ -575,32 +595,23 @@ app.post(
         body: JSON.stringify(requestBody),
       });
 
-      console.log(`[CREATE] Evolution response status: ${evoResponse.status}`);
-      
-      const data = await evoResponse.json().catch((err) => {
-        console.error(`[CREATE] Failed to parse Evolution response JSON: ${err.message}`);
-        return {};
-      });
-      
-      const rawText = JSON.stringify(data);
-      console.log(`[CREATE] Evolution response body:`, rawText);
+      const data = await evoResponse.json().catch(() => ({}));
+      const rawText = JSON.stringify(data); // used for matching only, never logged (holds tokens / QR)
+      console.log(`[CREATE] Evolution responded with status ${evoResponse.status}`);
 
       if (evoResponse.ok) {
-        console.log(`[CREATE] ✅ Instance created successfully!`);
         registerInstance(instanceName, deviceId);
-        
-        // GUARANTEE webhook is attached (Evolution v2 sometimes ignores it in the initial create payload)
+
+        // Evolution v2 sometimes ignores the webhook in the create payload, so attach it explicitly.
         await configureWebhook(instanceName);
-        
-        console.log(`[CREATE] Returning success to client`);
-        console.log("========== [CREATE INSTANCE] END ==========\n");
-        
-        // Return pairingCode to Android app if it was generated during creation
-        return res.status(201).json({ 
-          instanceName, 
-          deviceSecret,
-          pairingCode: data.pairingCode || null 
-        });
+
+        let pairingCode = null;
+        if (wantsPairing) {
+          pairingCode = data?.qrcode?.pairingCode ?? data?.pairingCode ?? null;
+          if (!pairingCode) pairingCode = await fetchPairingCode(instanceName, deviceSecret, phone);
+        }
+        console.log(`[CREATE] ✅ created ${instanceName}, pairingCode ${pairingCode ? "present" : "absent"}`);
+        return res.status(201).json({ instanceName, deviceSecret, pairingCode });
       }
 
       // Instance for this number already exists. Only the device whose secret is the instance
@@ -609,37 +620,42 @@ app.post(
         [400, 403, 409].includes(evoResponse.status) && /already (in use|exists)/i.test(rawText);
 
       if (alreadyExists) {
-        console.log(`[CREATE] Instance already exists, checking ownership...`);
         const access = await instanceAccess(instanceName, deviceSecret);
-        console.log(`[CREATE] Instance access result: ${access}`);
-        
+        console.log(`[CREATE] ${instanceName} already exists, access=${access}`);
+
         if (access === "owned") {
-          console.log(`[CREATE] ✅ Device owns existing instance, reusing`);
           registerInstance(instanceName, deviceId);
           await configureWebhook(instanceName); // heals instances created without a webhook
-          console.log("========== [CREATE INSTANCE] END (REUSED) ==========\n");
-          return res.status(200).json({ instanceName, deviceSecret, alreadyExisted: true });
+
+          const state = await getInstanceState(instanceName, deviceSecret);
+          let pairingCode = null;
+          if (wantsPairing && state !== "open") {
+            pairingCode = await fetchPairingCode(instanceName, deviceSecret, phone);
+          }
+          console.log(`[CREATE] ✅ reused ${instanceName}, state=${state}, pairingCode ${pairingCode ? "present" : "absent"}`);
+          return res.status(200).json({
+            instanceName,
+            deviceSecret,
+            alreadyExisted: true,
+            connectionState: state,
+            pairingCode,
+          });
         }
         if (access === "foreign") {
-          console.log(`[CREATE] ❌ Instance exists but owned by different device`);
-          console.log("========== [CREATE INSTANCE] END (FOREIGN) ==========\n");
+          // Wording avoids "already in use" / "already exists" on purpose: the Android app treats
+          // those phrases as a recoverable case and would look for a secret that isn't there.
           return res.status(409).json({ error: "This number is linked to a different device." });
         }
-        console.log(`[CREATE] ❌ Could not verify existing instance`);
-        console.log("========== [CREATE INSTANCE] END (ERROR) ==========\n");
         return res.status(502).json({ error: "Could not verify the existing instance. Try again." });
       }
 
-      console.log(`[CREATE] ❌ Evolution rejected instance creation`);
-      console.log("========== [CREATE INSTANCE] END (REJECTED) ==========\n");
+      console.warn(`[CREATE] ❌ Evolution rejected creation of ${instanceName} (HTTP ${evoResponse.status})`);
       return res.status(evoResponse.status >= 400 ? evoResponse.status : 502).json({
         error: "Evolution API rejected instance creation",
         details: data?.response?.message ?? data?.message ?? data?.error ?? null,
       });
     } catch (err) {
       console.error(`[CREATE] ❌ Evolution API context error: ${err.message}`);
-      console.error(`[CREATE] Stack trace:`, err.stack);
-      console.log("========== [CREATE INSTANCE] END (EXCEPTION) ==========\n");
       return res.status(500).json({ error: "Evolution API context error", details: err.message });
     }
   }
@@ -647,14 +663,12 @@ app.post(
 
 // Endpoint for Android to register its FCM token
 app.post("/api/device/fcm", verifyDynamicHmac, async (req, res) => {
-  console.log(`[FCM] FCM registration request from device: ${req.deviceId}`);
-  
   const { fcmToken } = req.body ?? {};
   if (typeof fcmToken !== "string" || fcmToken.length < 10 || fcmToken.length > 4096) {
-    console.error(`[FCM] ❌ Invalid FCM token length: ${fcmToken?.length}`);
+    console.error(`[FCM] ❌ Invalid FCM token length from device ${req.deviceId}`);
     return res.status(400).json({ error: "Invalid FCM token" });
   }
-  
+
   deviceFcmTokens.set(req.deviceId, fcmToken);
   console.log(`[FCM] ✅ Stored FCM token for device ${req.deviceId}`);
 
@@ -662,15 +676,13 @@ app.post("/api/device/fcm", verifyDynamicHmac, async (req, res) => {
   // prove it owns the instance. Otherwise any device could claim someone else's messages.
   const claimed = req.get("x-instance-name");
   if (claimed && isValidInstanceName(claimed)) {
-    console.log(`[FCM] Checking claimed instance: ${claimed}`);
     if ((await instanceAccess(claimed, req.deviceToken)) === "owned") {
       registerInstance(claimed, req.deviceId);
-      console.log(`[FCM] ✅ Rebuilt instance mapping: ${claimed} -> ${req.deviceId}`);
     } else {
       console.warn(`[FCM] ❌ Device ${req.deviceId} does not own instance ${claimed}`);
     }
   }
-  
+
   return res.status(200).json({ success: true });
 });
 
@@ -678,52 +690,46 @@ app.post("/api/instance/release", verifyDynamicHmac, async (req, res) => {
   const instanceName = resolveInstanceName(req);
   if (!instanceName) return res.status(400).json({ error: "Invalid instance name" });
 
-  console.log(`[RELEASE] Release request for instance: ${instanceName}, device: ${req.deviceId}`);
+  console.log(`[RELEASE] Release request for ${instanceName} from device ${req.deviceId}`);
 
   try {
     const access = await instanceAccess(instanceName, req.deviceToken);
-    console.log(`[RELEASE] Instance access result: ${access}`);
 
     if (access === "missing") {
-      console.log(`[RELEASE] Instance already deleted`);
       unregisterInstance(instanceName, req.deviceId);
       return res.status(200).json({ success: true, message: "Instance already deleted" });
     }
     if (access === "foreign") {
-      console.error(`[RELEASE] ❌ Device does not own instance`);
+      console.error(`[RELEASE] ❌ Device ${req.deviceId} does not own ${instanceName}`);
       return res.status(403).json({ error: "This device does not own that instance" });
     }
     if (access === "error") {
-      console.error(`[RELEASE] ❌ Could not verify ownership`);
       return res.status(502).json({ error: "Could not verify instance ownership" });
     }
 
     // Ownership proven. Log out first (a connected instance may refuse deletion), then delete.
     try {
-      console.log(`[RELEASE] Logging out instance ${instanceName}...`);
       await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/logout/${encodeURIComponent(instanceName)}`, {
         method: "DELETE",
         headers: { apikey: EVOLUTION_GLOBAL_KEY },
       });
-      console.log(`[RELEASE] ✅ Logout successful`);
     } catch (err) {
       console.warn(`[RELEASE] Logout failed (best effort): ${err.message}`);
     }
 
-    console.log(`[RELEASE] Deleting instance ${instanceName}...`);
     const evoResponse = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/delete/${encodeURIComponent(instanceName)}`, {
       method: "DELETE",
       headers: { apikey: EVOLUTION_GLOBAL_KEY, "Content-Type": "application/json" },
     });
 
     if (evoResponse.ok || evoResponse.status === 404) {
-      console.log(`[RELEASE] ✅ Instance deleted`);
+      console.log(`[RELEASE] ✅ ${instanceName} released`);
       unregisterInstance(instanceName, req.deviceId);
       return res.status(200).json({ success: true, message: "Instance released or already deleted" });
     }
 
     const errorData = await evoResponse.text();
-    console.error(`[RELEASE] ❌ Evolution failed to delete: ${evoResponse.status} - ${errorData}`);
+    console.error(`[RELEASE] ❌ Evolution failed to delete ${instanceName}: HTTP ${evoResponse.status}`);
     return res.status(evoResponse.status).json({ error: "Evolution failed to delete", details: errorData });
   } catch (err) {
     console.error(`[RELEASE] ❌ Failed to release instance: ${err.message}`);
@@ -761,8 +767,6 @@ app.get("/api/instance/status", verifyDynamicHmac, async (req, res) => {
   const instanceName = resolveInstanceName(req);
   if (!instanceName) return res.status(400).json({ error: "Invalid instance name" });
 
-  console.log(`[STATUS] Status request for instance: ${instanceName}`);
-
   try {
     // Evolution checks that the device secret matches this instance's token.
     const evoResponse = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/connectionState/${encodeURIComponent(instanceName)}`, {
@@ -770,7 +774,6 @@ app.get("/api/instance/status", verifyDynamicHmac, async (req, res) => {
       headers: { "apikey": req.deviceToken },
     });
     const data = await evoResponse.json().catch(() => ({}));
-    console.log(`[STATUS] Connection state: ${evoResponse.status}`);
     return res.status(evoResponse.status).json(data);
   } catch (err) {
     console.error(`[STATUS] Failed to pull state connection: ${err.message}`);
@@ -813,19 +816,15 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
 
     // 1. Incoming messages (and delete-for-everyone, which arrives as a protocol message)
     if (event === "messages.upsert") {
-      console.log(`[WEBHOOK] Processing ${items.length} message(s)`);
       for (const item of items) {
         const key = item?.key;
-        if (!key || key.fromMe) {
-          if (key?.fromMe) console.log(`[WEBHOOK] Skipping own message`);
-          continue; // ignore the owner's own messages
-        }
+        if (!key || key.fromMe) continue; // ignore the owner's own messages
 
         // Newer WhatsApp accounts use @lid. Prefer the phone-number JID when Evolution provides it.
         const phoneNumber =
           jidToPhone(key.remoteJidAlt) || jidToPhone(key.senderPn) || jidToPhone(key.remoteJid);
         if (!phoneNumber) {
-          console.log(`[WEBHOOK] Skipped non-user or unresolved JID: ${key.remoteJid}`);
+          console.log(`[WEBHOOK] Skipped non-user or unresolved JID`);
           continue;
         }
 
@@ -845,12 +844,10 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
         }
 
         const messageText = extractMessageText(item.message);
-        if (!messageText) {
-          console.log(`[WEBHOOK] No text content in message, skipping`);
-          continue;
-        }
+        if (!messageText) continue;
 
-        console.log(`[WEBHOOK] Incoming message from ${phoneNumber}: ${messageText.slice(0, 50)}...`);
+        // Message content is never logged.
+        console.log(`[WEBHOOK] Incoming message from ${phoneNumber} (${messageText.length} chars)`);
         await sendFcmData(instanceName, {
           type: "NEW_WHATSAPP_MESSAGE",
           phoneNumber,
@@ -864,7 +861,6 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
 
     // 2. Anti-Delete Retention (Money Lending Compliance)
     if (event === "messages.delete" || event === "message.revoke") {
-      console.log(`[WEBHOOK] Processing delete/revoke event`);
       for (const item of items) {
         const messageId = item?.key?.id || item?.id;
         if (!messageId) continue;
@@ -881,7 +877,6 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
     // 3. Presence Tracking (Money Lending Compliance)
     // Only arrives for contacts the instance has subscribed to via Evolution's presence subscribe.
     if (event === "presence.update") {
-      console.log(`[WEBHOOK] Processing presence update`);
       for (const item of items) {
         const jid = item?.id;
         const presence = item?.presence || item?.presences?.[jid]?.lastKnownPresence;
@@ -900,7 +895,6 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
     res.status(200).json({ success: true });
   } catch (err) {
     console.error("[WEBHOOK] Error processing Evolution payload:", err.message);
-    console.error("[WEBHOOK] Stack:", err.stack);
     res.status(500).json({ error: "Webhook processing failed" });
   }
 });
@@ -936,14 +930,13 @@ const server = app.listen(PORT, async () => {
   try {
     const firebasePath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "/run/secrets/serviceAccountKey.json";
     console.log(`[FCM] Attempting to load Firebase config from: ${firebasePath}`);
-    
+
     initializeApp({
       credential: cert(firebasePath)
     });
     console.log("[FCM] ✅ Firebase Admin initialized successfully.");
   } catch (err) {
     console.error("[FCM] ❌ Failed to initialize Firebase Admin. FCM pushes will fail.", err.message);
-    console.error("[FCM] Stack:", err.stack);
   }
 
   if (AI_PROVIDER === "ollama") {
@@ -951,7 +944,7 @@ const server = app.listen(PORT, async () => {
     for (const runner of RUNNERS) {
       try {
         await waitForRunner(runner);
-        console.log(`[OLLAMA] ✅ Runner ready: ${runner.url}`);
+        console.log(`[OLLAMA] ✅ Runner ready: ${safeUrl(runner.url)}`);
       } catch (err) {
         console.error(`[OLLAMA] ❌ Runner diagnostic alert: ${err.message}`);
       }
