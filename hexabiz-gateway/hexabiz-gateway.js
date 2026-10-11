@@ -514,9 +514,11 @@ app.post(
     console.log(`[CREATE] Request from IP: ${req.ip}`);
     console.log(`[CREATE] Request body:`, JSON.stringify(req.body, null, 2));
     
-    const { deviceId } = req.body ?? {};
+    // Accept 'usePairingCode' flag from Android app (defaults to false)
+    const { deviceId, usePairingCode } = req.body ?? {};
+    
     if (!isValidDeviceId(deviceId)) {
-      console.error(`[CREATE]  Invalid device ID: ${deviceId}`);
+      console.error(`[CREATE] Invalid device ID: ${deviceId}`);
       return res.status(400).json({ error: "Invalid device ID assignment" });
     }
     console.log(`[CREATE] ✅ Valid device ID: ${deviceId}`);
@@ -537,10 +539,11 @@ app.post(
     const webhookConfig = buildWebhookConfig();
     console.log(`[CREATE] Webhook config:`, JSON.stringify(webhookConfig, null, 2));
 
+    // DEFAULT to QR Code, but allow Pairing Code if explicitly requested by the Android app
     const requestBody = {
       instanceName,
       token: deviceSecret,
-      qrcode: true,
+      qrcode: !usePairingCode, // true for QR (default), false for Pairing Code
       integration: "WHATSAPP-BAILEYS",
       groupsIgnore: true,
       alwaysOnline: false,
@@ -549,6 +552,14 @@ app.post(
       rejectCall: false,
       webhook: webhookConfig,
     };
+
+    // If pairing code is requested, pass the number to Evolution API
+    if (usePairingCode) {
+      requestBody.number = phone;
+      console.log(`[CREATE] Mode: Pairing Code (number provided to Evolution)`);
+    } else {
+      console.log(`[CREATE] Mode: QR Code (default)`);
+    }
 
     console.log(`[CREATE] Sending to Evolution:`);
     console.log(`[CREATE]   URL: ${EVOLUTION_SERVER_URL}/instance/create`);
@@ -577,9 +588,19 @@ app.post(
       if (evoResponse.ok) {
         console.log(`[CREATE] ✅ Instance created successfully!`);
         registerInstance(instanceName, deviceId);
+        
+        // GUARANTEE webhook is attached (Evolution v2 sometimes ignores it in the initial create payload)
+        await configureWebhook(instanceName);
+        
         console.log(`[CREATE] Returning success to client`);
         console.log("========== [CREATE INSTANCE] END ==========\n");
-        return res.status(201).json({ instanceName, deviceSecret });
+        
+        // Return pairingCode to Android app if it was generated during creation
+        return res.status(201).json({ 
+          instanceName, 
+          deviceSecret,
+          pairingCode: data.pairingCode || null 
+        });
       }
 
       // Instance for this number already exists. Only the device whose secret is the instance
@@ -601,8 +622,6 @@ app.post(
         }
         if (access === "foreign") {
           console.log(`[CREATE] ❌ Instance exists but owned by different device`);
-          // Wording avoids "already in use" / "already exists" on purpose: the Android app treats
-          // those phrases as a recoverable case and would look for a secret that isn't there.
           console.log("========== [CREATE INSTANCE] END (FOREIGN) ==========\n");
           return res.status(409).json({ error: "This number is linked to a different device." });
         }
