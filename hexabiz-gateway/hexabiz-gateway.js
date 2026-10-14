@@ -1,5 +1,5 @@
 import express from "express";
-import helmet from "helmet";
+import helmet from "helmet";webh
 import fetch from "node-fetch";
 import crypto from "crypto";
 import { initializeApp, cert } from "firebase-admin/app";
@@ -212,10 +212,11 @@ function unregisterInstance(instanceName, deviceId) {
 // NOTE: Updated for Evolution API v2.x schema compatibility
 function buildWebhookConfig() {
   return {
+    enabled: true,
     url: `${GATEWAY_PUBLIC_URL}/webhook/evolution?s=${WEBHOOK_SECRET}`,
     events: WEBHOOK_EVENTS,
     webhook_by_events: false, // Evolution v2 exact schema
-    webhook_base64: false,    // Evolution v2 exact schema
+    webhook_base64: false,    // Evolution v2 exa  ct schema
     headers: { "x-webhook-secret": WEBHOOK_SECRET },
   };
 }
@@ -760,26 +761,36 @@ app.post(
 
 app.post("/api/device/fcm", verifyDynamicHmac, async (req, res) => {
   const { fcmToken } = req.body ?? {};
+  const claimedInstance = req.get("x-instance-name");
+
+  // Enhanced logging to diagnose Android-to-Gateway mismatches
+  console.log(`[FCM] Registration attempt -> deviceId: ${req.deviceId}, instance: ${claimedInstance || 'none'}`);
+
   if (typeof fcmToken !== "string" || fcmToken.length < 10 || fcmToken.length > 4096) {
     console.error(`[FCM] ❌ Invalid FCM token length from device ${req.deviceId}`);
-    return res.status(400).json({ error: "Invalid FCM token" });
+    return res.status(400).json({ error: "Invalid FCM token format" });
   }
 
+  // 1. Always save the token for this deviceId
   deviceFcmTokens.set(req.deviceId, fcmToken);
   console.log(`[FCM] ✅ Stored FCM token for device ${req.deviceId}`);
 
-  const claimed = req.get("x-instance-name");
-  if (claimed && isValidInstanceName(claimed)) {
-    if ((await instanceAccess(claimed, req.deviceToken)) === "owned") {
-      registerInstance(claimed, req.deviceId);
+  // 2. If an instance name is provided, verify ownership and link them
+  if (claimedInstance && isValidInstanceName(claimedInstance)) {
+    const access = await instanceAccess(claimedInstance, req.deviceToken);
+    if (access === "owned") {
+      registerInstance(claimedInstance, req.deviceId);
+      console.log(`[FCM] ✅ Successfully linked instance ${claimedInstance} to device ${req.deviceId}`);
     } else {
-      console.warn(`[FCM] ❌ Device ${req.deviceId} does not own instance ${claimed}`);
+      console.warn(`[FCM] ❌ Device ${req.deviceId} does NOT own instance ${claimedInstance} (access check returned: ${access})`);
+      // We still return 200 for the token storage, but warn about the instance link failure
     }
+  } else {
+    console.log(`[FCM] ℹ️ Token stored, but no valid 'x-instance-name' header provided. Will link on first message.`);
   }
 
-  return res.status(200).json({ success: true });
+  return res.status(200).json({ success: true, message: "FCM token registered" });
 });
-
 app.post("/api/instance/release", verifyDynamicHmac, async (req, res) => {
   const instanceName = resolveInstanceName(req);
   if (!instanceName) return res.status(400).json({ error: "Invalid instance name" });
@@ -944,10 +955,9 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
           continue;
         }
 
-        console.log(`[WEBHOOK] Syncing message from ${phoneNumber} (${messageText.length} chars), fromMe: ${key.fromMe}`);
+                console.log(`[WEBHOOK] Syncing message from ${phoneNumber} (${messageText.length} chars), fromMe: ${key.fromMe}`);
         
         await sendFcmData(instanceName, {
-          // Use different types so the mobile app can render sent vs received correctly
           type: key.fromMe ? "SENT_WHATSAPP_MESSAGE" : "NEW_WHATSAPP_MESSAGE",
           phoneNumber,
           pushName: item.pushName || "Unknown",
@@ -955,7 +965,7 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
           messageId: key.id || "",
           instanceName,
           isFromMe: String(key.fromMe), // FCM requires string values
-          hasMedia: String(isMedia),
+          hasMedia: String(isMedia),    // FCM requires string values
         });
       }
     }
