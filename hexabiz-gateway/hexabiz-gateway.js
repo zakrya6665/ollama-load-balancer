@@ -53,7 +53,7 @@ console.log("[CONFIG] AI Provider:", AI_PROVIDER);
 const rateLimits = new Map();
 const usedNonces = new Map();
 const instanceCreationLimits = new Map();
-const instanceToDeviceMap = new Map(); // instanceName -> deviceId  (in-memory; rebuilt when the app re-registers its FCM token)
+const instanceToDeviceMap = new Map(); // instanceName -> deviceId
 const deviceToInstanceMap = new Map(); // deviceId -> instanceName
 const deviceFcmTokens = new Map();     // deviceId -> FCM token
 
@@ -72,6 +72,9 @@ const WEBHOOK_EVENTS = [
 ];
 
 const MAX_FCM_TEXT = 1500; // FCM data payloads are capped at 4 KB total
+
+// Global state for health checks
+let isFirebaseReady = false;
 
 // ============================================================
 // Small helpers
@@ -206,15 +209,14 @@ function unregisterInstance(instanceName, deviceId) {
 // Evolution helpers
 // ============================================================
 
-// NOTE: this builds the config only. Never log it: it contains the webhook secret.
+// NOTE: Updated for Evolution API v2.x schema compatibility
 function buildWebhookConfig() {
   return {
-    enabled: true,
     url: `${GATEWAY_PUBLIC_URL}/webhook/evolution?s=${WEBHOOK_SECRET}`,
-    byEvents: false,
-    base64: false,
-    headers: { "x-webhook-secret": WEBHOOK_SECRET },
     events: WEBHOOK_EVENTS,
+    webhook_by_events: false, // Evolution v2 exact schema
+    webhook_base64: false,    // Evolution v2 exact schema
+    headers: { "x-webhook-secret": WEBHOOK_SECRET },
   };
 }
 
@@ -275,9 +277,6 @@ async function getInstanceState(instanceName, deviceSecret) {
 
 /**
  * Asks Evolution for a pairing code: GET /instance/connect/{name}?number=...
- * - Works from the "close" state. A socket stuck in "connecting" ignores the number and only
- *   returns a cached QR, so after the first miss the instance is logged out once and retried.
- * - Returns the code string, or null. The app falls back to its own connect call when null.
  */
 async function fetchPairingCode(instanceName, deviceSecret, phone) {
   const url = `${EVOLUTION_SERVER_URL}/instance/connect/${encodeURIComponent(instanceName)}?number=${phone}`;
@@ -307,15 +306,23 @@ async function fetchPairingCode(instanceName, deviceSecret, phone) {
 /** Best effort: (re)attach the webhook to an existing instance. Needs Evolution v2 /webhook/set. */
 async function configureWebhook(instanceName) {
   try {
+    // Evolution v2 sometimes needs a brief moment after creation to accept webhook configs
+    await sleep(1500); 
+    
     const r = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/webhook/set/${encodeURIComponent(instanceName)}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", apikey: EVOLUTION_GLOBAL_KEY },
+      headers: { 
+        "Content-Type": "application/json", 
+        "apikey": EVOLUTION_GLOBAL_KEY 
+      },
       body: JSON.stringify({ webhook: buildWebhookConfig() }),
     });
+    
     if (!r.ok) {
-      console.warn(`[WEBHOOK] webhook/set for ${instanceName} returned HTTP ${r.status}`);
+      const errText = await r.text().catch(() => "Unknown error");
+      console.warn(`[WEBHOOK] webhook/set for ${instanceName} returned HTTP ${r.status}: ${errText}`);
     } else {
-      console.log(`[WEBHOOK] Webhook configured for ${instanceName}`);
+      console.log(`[WEBHOOK] ✅ Webhook successfully configured for ${instanceName}`);
     }
   } catch (err) {
     console.error(`[WEBHOOK] webhook/set for ${instanceName} failed: ${err.message}`);
@@ -336,7 +343,6 @@ function resolveInstanceName(req) {
 function verifyEnrollmentKey(req, res, next) {
   const supplied = req.get("x-enrollment-key");
   if (!supplied || !safeEqualText(supplied, APP_ENROLLMENT_KEY)) {
-    // Lengths only (never the key). A difference of 1-2 usually means a stray space, newline or quote.
     console.warn(
       `[SECURITY] Enrollment key rejected from ${req.ip} (supplied length=${supplied ? supplied.length : 0}, expected length=${APP_ENROLLMENT_KEY.length})`
     );
@@ -546,7 +552,106 @@ app.use(express.json({
   }
 }));
 
-// --- TIER 1: HIGH VALUE ADMIN OPERATIONS ---
+// ============================================================
+// PUBLIC FACING: Health Check & API Introduction
+// ============================================================
+
+// 1. Luxurious Root Introduction (GET /)
+app.get("/", (req, res) => {
+  const html = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>HexaSynq Gateway | HexaBiz Solutions</title>
+      <style>
+        :root { --bg: #0a0a0f; --card: #13131f; --accent: #00f0ff; --text: #e0e0e0; --muted: #888899; }
+        body { margin: 0; font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; }
+        .container { text-align: center; max-width: 600px; padding: 2rem; background: var(--card); border: 1px solid rgba(0, 240, 255, 0.1); border-radius: 16px; box-shadow: 0 0 40px rgba(0, 240, 255, 0.05); }
+        .logo { font-size: 2.5rem; font-weight: 800; letter-spacing: -1px; margin-bottom: 0.5rem; background: linear-gradient(90deg, #fff, var(--accent)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .subtitle { color: var(--muted); font-size: 1rem; margin-bottom: 2rem; }
+        .badge { display: inline-block; padding: 4px 12px; background: rgba(0, 240, 255, 0.1); color: var(--accent); border-radius: 20px; font-size: 0.8rem; font-weight: 600; margin: 4px; border: 1px solid rgba(0, 240, 255, 0.2); }
+        .footer { margin-top: 2rem; font-size: 0.8rem; color: var(--muted); border-top: 1px solid rgba(255,255,255,0.05); padding-top: 1rem; }
+        .status-dot { display: inline-block; width: 8px; height: 8px; background: #00ff88; border-radius: 50%; margin-right: 6px; box-shadow: 0 0 8px #00ff88; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="logo">HexaSynq Gateway</div>
+        <div class="subtitle">Secure AI & WhatsApp Orchestration Layer by <strong>HexaBiz Solutions</strong></div>
+        
+        <div>
+          <span class="badge">v2.3.7</span>
+          <span class="badge">Node.js / Express</span>
+          <span class="badge">Evolution API v2</span>
+          <span class="badge">Ollama / FCM</span>
+        </div>
+
+        <div style="margin-top: 2rem; text-align: left; background: rgba(0,0,0,0.3); padding: 1rem; border-radius: 8px; font-family: monospace; font-size: 0.85rem;">
+          <div><span class="status-dot"></span> API Gateway: <span style="color:#00ff88">Operational</span></div>
+          <div style="margin-top:8px; color: var(--muted);">Endpoint: <span style="color:var(--accent)">${GATEWAY_PUBLIC_URL}</span></div>
+          <div style="margin-top:8px; color: var(--muted);">For programmatic access, please refer to the internal API documentation or contact the system administrator.</div>
+        </div>
+
+        <div class="footer">
+          &copy; ${new Date().getFullYear()} HexaBiz Solutions. All systems secured via HMAC-256 & End-to-End Encryption.
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+  res.setHeader('Content-Type', 'text/html');
+  res.status(200).send(html);
+});
+
+// 2. Deep Health Check for Coolify (GET /health)
+app.get("/health", async (req, res) => {
+  const health = {
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    checks: {
+      evolution_api: "unknown",
+      ollama: "unknown",
+      firebase: isFirebaseReady ? "ok" : "degraded",
+    }
+  };
+
+  // Check Evolution API
+  try {
+    const evoRes = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/`, { method: "GET" });
+    // 404 is fine, it just means the root path isn't a specific endpoint, but the server is responding
+    health.checks.evolution_api = evoRes.ok || evoRes.status === 404 ? "ok" : "degraded";
+  } catch {
+    health.checks.evolution_api = "down";
+  }
+
+  // Check Ollama (Primary Runner)
+  if (AI_PROVIDER === "ollama" && RUNNERS.length > 0) {
+    try {
+      const ollamaRes = await fetchWithTimeout(`${RUNNERS[0].url}/api/tags`, { method: "GET" });
+      health.checks.ollama = ollamaRes.ok ? "ok" : "degraded";
+    } catch {
+      health.checks.ollama = "down";
+    }
+  } else {
+    health.checks.ollama = "skipped";
+  }
+
+  // Determine overall status
+  if (health.checks.evolution_api === "down" || health.checks.ollama === "down") {
+    health.status = "degraded";
+    return res.status(503).json(health); // 503 tells Coolify to restart or alert
+  }
+
+  res.status(200).json(health);
+});
+
+// ============================================================
+// TIER 1: HIGH VALUE ADMIN OPERATIONS
+// ============================================================
+
 app.post(
   "/api/instance/create",
   verifyEnrollmentKey,
@@ -554,7 +659,6 @@ app.post(
   verifyPlayIntegrityToken,
   async (req, res) => {
     const { deviceId } = req.body ?? {};
-    // The Android app sets this to true when the user chose "Pairing Code" (QR users leave it out).
     const wantsPairing = req.body?.usePairingCode === true;
 
     if (!isValidDeviceId(deviceId)) {
@@ -565,12 +669,10 @@ app.post(
       return res.status(400).json({ error: "Invalid phone number. Use country code + number, 8 to 15 digits." });
     }
 
-    const instanceName = deriveInstanceName(phone); // dev_<number>
+    const instanceName = deriveInstanceName(phone);
     const deviceSecret = deriveDeviceSecret(deviceId);
     console.log(`[CREATE] instance=${instanceName} device=${deviceId} mode=${wantsPairing ? "pairing" : "qr"}`);
 
-    // qrcode:true makes Evolution open the socket. With "number" present it also returns a
-    // pairingCode (inside data.qrcode). Without "number" you get the QR only.
     const requestBody = {
       instanceName,
       token: deviceSecret,
@@ -596,13 +698,12 @@ app.post(
       });
 
       const data = await evoResponse.json().catch(() => ({}));
-      const rawText = JSON.stringify(data); // used for matching only, never logged (holds tokens / QR)
+      const rawText = JSON.stringify(data);
+
       console.log(`[CREATE] Evolution responded with status ${evoResponse.status}`);
 
       if (evoResponse.ok) {
         registerInstance(instanceName, deviceId);
-
-        // Evolution v2 sometimes ignores the webhook in the create payload, so attach it explicitly.
         await configureWebhook(instanceName);
 
         let pairingCode = null;
@@ -614,8 +715,6 @@ app.post(
         return res.status(201).json({ instanceName, deviceSecret, pairingCode });
       }
 
-      // Instance for this number already exists. Only the device whose secret is the instance
-      // token may reuse it. Anyone else gets 409 instead of a "success" that won't work later.
       const alreadyExists =
         [400, 403, 409].includes(evoResponse.status) && /already (in use|exists)/i.test(rawText);
 
@@ -625,7 +724,7 @@ app.post(
 
         if (access === "owned") {
           registerInstance(instanceName, deviceId);
-          await configureWebhook(instanceName); // heals instances created without a webhook
+          await configureWebhook(instanceName);
 
           const state = await getInstanceState(instanceName, deviceSecret);
           let pairingCode = null;
@@ -642,8 +741,6 @@ app.post(
           });
         }
         if (access === "foreign") {
-          // Wording avoids "already in use" / "already exists" on purpose: the Android app treats
-          // those phrases as a recoverable case and would look for a secret that isn't there.
           return res.status(409).json({ error: "This number is linked to a different device." });
         }
         return res.status(502).json({ error: "Could not verify the existing instance. Try again." });
@@ -661,7 +758,6 @@ app.post(
   }
 );
 
-// Endpoint for Android to register its FCM token
 app.post("/api/device/fcm", verifyDynamicHmac, async (req, res) => {
   const { fcmToken } = req.body ?? {};
   if (typeof fcmToken !== "string" || fcmToken.length < 10 || fcmToken.length > 4096) {
@@ -672,8 +768,6 @@ app.post("/api/device/fcm", verifyDynamicHmac, async (req, res) => {
   deviceFcmTokens.set(req.deviceId, fcmToken);
   console.log(`[FCM] ✅ Stored FCM token for device ${req.deviceId}`);
 
-  // Rebuild the instance -> device mapping after a gateway restart, but only if the device can
-  // prove it owns the instance. Otherwise any device could claim someone else's messages.
   const claimed = req.get("x-instance-name");
   if (claimed && isValidInstanceName(claimed)) {
     if ((await instanceAccess(claimed, req.deviceToken)) === "owned") {
@@ -707,7 +801,6 @@ app.post("/api/instance/release", verifyDynamicHmac, async (req, res) => {
       return res.status(502).json({ error: "Could not verify instance ownership" });
     }
 
-    // Ownership proven. Log out first (a connected instance may refuse deletion), then delete.
     try {
       await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/logout/${encodeURIComponent(instanceName)}`, {
         method: "DELETE",
@@ -737,7 +830,10 @@ app.post("/api/instance/release", verifyDynamicHmac, async (req, res) => {
   }
 });
 
-// --- TIER 2: ROUTINE OPERATIONS ---
+// ============================================================
+// TIER 2: ROUTINE OPERATIONS
+// ============================================================
+
 app.post("/api/chat", verifyDynamicHmac, async (req, res) => {
   const { messages, prompt } = req.body;
   const ollamaPayload = messages ? { messages } : { prompt: extractPrompt(prompt) };
@@ -768,7 +864,6 @@ app.get("/api/instance/status", verifyDynamicHmac, async (req, res) => {
   if (!instanceName) return res.status(400).json({ error: "Invalid instance name" });
 
   try {
-    // Evolution checks that the device secret matches this instance's token.
     const evoResponse = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/connectionState/${encodeURIComponent(instanceName)}`, {
       method: "GET",
       headers: { "apikey": req.deviceToken },
@@ -785,7 +880,6 @@ app.get("/api/instance/status", verifyDynamicHmac, async (req, res) => {
 // WEBHOOKS (FCM + Money Lending Compliance)
 // ============================================================
 
-/** Only real user JIDs. Groups (@g.us), status@broadcast and unresolved @lid return null. */
 function jidToPhone(jid) {
   if (typeof jid !== "string") return null;
   const m = jid.match(/^(\d{8,15})(?::\d+)?@(?:s\.whatsapp\.net|c\.us)$/);
@@ -808,19 +902,16 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
   try {
     const payload = req.body ?? {};
     const instanceName = payload.instance;
-    // Evolution sends "messages.upsert"; normalise in case a version sends MESSAGES_UPSERT.
     const event = String(payload.event ?? "").toLowerCase().replace(/_/g, ".");
     const items = Array.isArray(payload.data) ? payload.data : payload.data ? [payload.data] : [];
 
     console.log(`[WEBHOOK] Received event: ${event} for instance: ${instanceName}`);
 
-    // 1. Incoming messages (and delete-for-everyone, which arrives as a protocol message)
     if (event === "messages.upsert") {
       for (const item of items) {
         const key = item?.key;
-        if (!key || key.fromMe) continue; // ignore the owner's own messages
+        if (!key || key.fromMe) continue;
 
-        // Newer WhatsApp accounts use @lid. Prefer the phone-number JID when Evolution provides it.
         const phoneNumber =
           jidToPhone(key.remoteJidAlt) || jidToPhone(key.senderPn) || jidToPhone(key.remoteJid);
         if (!phoneNumber) {
@@ -837,7 +928,7 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
               type: "MESSAGE_DELETED",
               messageId,
               phoneNumber,
-              originalText: "", // WhatsApp does not resend the text; the app must look it up by messageId
+              originalText: "",
             });
           }
           continue;
@@ -846,7 +937,6 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
         const messageText = extractMessageText(item.message);
         if (!messageText) continue;
 
-        // Message content is never logged.
         console.log(`[WEBHOOK] Incoming message from ${phoneNumber} (${messageText.length} chars)`);
         await sendFcmData(instanceName, {
           type: "NEW_WHATSAPP_MESSAGE",
@@ -859,7 +949,6 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
       }
     }
 
-    // 2. Anti-Delete Retention (Money Lending Compliance)
     if (event === "messages.delete" || event === "message.revoke") {
       for (const item of items) {
         const messageId = item?.key?.id || item?.id;
@@ -874,8 +963,6 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
       }
     }
 
-    // 3. Presence Tracking (Money Lending Compliance)
-    // Only arrives for contacts the instance has subscribed to via Evolution's presence subscribe.
     if (event === "presence.update") {
       for (const item of items) {
         const jid = item?.id;
@@ -934,6 +1021,7 @@ const server = app.listen(PORT, async () => {
     initializeApp({
       credential: cert(firebasePath)
     });
+    isFirebaseReady = true; // <-- UPDATED: Flag for health check
     console.log("[FCM] ✅ Firebase Admin initialized successfully.");
   } catch (err) {
     console.error("[FCM] ❌ Failed to initialize Firebase Admin. FCM pushes will fail.", err.message);
