@@ -1,5 +1,5 @@
 import express from "express";
-import helmet from "helmet";webh
+import helmet from "helmet";
 import fetch from "node-fetch";
 import crypto from "crypto";
 import { initializeApp, cert } from "firebase-admin/app";
@@ -216,7 +216,7 @@ function buildWebhookConfig() {
     url: `${GATEWAY_PUBLIC_URL}/webhook/evolution?s=${WEBHOOK_SECRET}`,
     events: WEBHOOK_EVENTS,
     webhook_by_events: false, // Evolution v2 exact schema
-    webhook_base64: false,    // Evolution v2 exa  ct schema
+    webhook_base64: false,    // Evolution v2 exact schema
     headers: { "x-webhook-secret": WEBHOOK_SECRET },
   };
 }
