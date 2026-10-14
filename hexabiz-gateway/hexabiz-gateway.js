@@ -882,7 +882,8 @@ app.get("/api/instance/status", verifyDynamicHmac, async (req, res) => {
 
 function jidToPhone(jid) {
   if (typeof jid !== "string") return null;
-  const m = jid.match(/^(\d{8,15})(?::\d+)?@(?:s\.whatsapp\.net|c\.us)$/);
+  // Updated to also match @lid and @hosted.lid formats
+  const m = jid.match(/^(\d{8,15})(?::\d+)?@(?:s\.whatsapp\.net|c\.us|lid|hosted\.lid)$/);
   return m ? m[1] : null;
 }
 
@@ -907,23 +908,24 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
 
     console.log(`[WEBHOOK] Received event: ${event} for instance: ${instanceName}`);
 
-    if (event === "messages.upsert") {
+        if (event === "messages.upsert") {
       for (const item of items) {
         const key = item?.key;
-        if (!key || key.fromMe) continue;
+        if (!key) continue; // REMOVED: key.fromMe check to allow AI replies and multi-device sync
 
         const phoneNumber =
           jidToPhone(key.remoteJidAlt) || jidToPhone(key.senderPn) || jidToPhone(key.remoteJid);
+        
         if (!phoneNumber) {
-          console.log(`[WEBHOOK] Skipped non-user or unresolved JID`);
+          console.log(`[WEBHOOK] Skipped non-user or unresolved JID: ${key.remoteJid}`);
           continue;
         }
 
         const protocol = item.message?.protocolMessage;
-        if (protocol && (protocol.type === 0 || protocol.type === "REVOKE")) {
+        if (protocol && (protocol.type === 0 || protocol.type === "REVOKE" || protocol.type === 7)) {
           const messageId = protocol.key?.id;
           if (messageId) {
-            console.log(`[WEBHOOK] Message revoked: ${messageId}`);
+            console.log(`[WEBHOOK] Message revoked/deleted: ${messageId}`);
             await sendFcmData(instanceName, {
               type: "MESSAGE_DELETED",
               messageId,
@@ -935,20 +937,47 @@ app.post("/webhook/evolution", verifyWebhookSecret, async (req, res) => {
         }
 
         const messageText = extractMessageText(item.message);
-        if (!messageText) continue;
+        const isMedia = !!(item.message?.imageMessage || item.message?.videoMessage || item.message?.audioMessage || item.message?.documentMessage || item.message?.stickerMessage);
 
-        console.log(`[WEBHOOK] Incoming message from ${phoneNumber} (${messageText.length} chars)`);
+        if (!messageText && !isMedia) {
+          console.log(`[WEBHOOK] Skipped message with no text or recognizable media content`);
+          continue;
+        }
+
+        console.log(`[WEBHOOK] Syncing message from ${phoneNumber} (${messageText.length} chars), fromMe: ${key.fromMe}`);
+        
         await sendFcmData(instanceName, {
-          type: "NEW_WHATSAPP_MESSAGE",
+          // Use different types so the mobile app can render sent vs received correctly
+          type: key.fromMe ? "SENT_WHATSAPP_MESSAGE" : "NEW_WHATSAPP_MESSAGE",
           phoneNumber,
           pushName: item.pushName || "Unknown",
-          messageText: messageText.slice(0, MAX_FCM_TEXT),
+          messageText: messageText ? messageText.slice(0, MAX_FCM_TEXT) : "[Media Message]",
           messageId: key.id || "",
           instanceName,
+          isFromMe: String(key.fromMe), // FCM requires string values
+          hasMedia: String(isMedia),
         });
       }
     }
+      if (event === "messages.update") {
+      for (const item of items) {
+        const key = item?.key;
+        const status = item?.update?.status; // 1=PENDING, 2=SERVER_ACK, 3=DELIVERY_ACK, 4=READ
+        if (!key || !status) continue;
 
+        const phoneNumber = jidToPhone(key.remoteJidAlt) || jidToPhone(key.remoteJid);
+        if (!phoneNumber) continue;
+
+        console.log(`[WEBHOOK] Message status update: ${key.id} -> status ${status} (fromMe: ${key.fromMe})`);
+        await sendFcmData(instanceName, {
+          type: "MESSAGE_STATUS_UPDATE",
+          messageId: key.id,
+          phoneNumber,
+          status: String(status),
+          isFromMe: String(key.fromMe),
+        });
+      }
+    }
     if (event === "messages.delete" || event === "message.revoke") {
       for (const item of items) {
         const messageId = item?.key?.id || item?.id;
