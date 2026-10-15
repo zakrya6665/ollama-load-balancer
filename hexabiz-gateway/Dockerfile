@@ -1,5 +1,5 @@
 # Use lightweight, secure Node.js 20 Alpine image
-FROM node:20-alpine
+FROM node:22-alpine
 
 # ---------------------------------------------------------
 # 1. Install curl for Coolify health checks (CRITICAL)
