@@ -25,6 +25,7 @@ services:
       - "3000:3000"
     environment:
       PORT: 3000
+      INSTANCE_CREATE_LIMIT: "${INSTANCE_CREATE_LIMIT}"
       OLLAMA_DEFAULT_MODEL: "synq:latest"
       OLLAMA_RUNNERS: "http://ollama:11434"
       EVOLUTION_SERVER_URL: "http://whatsapp_api:8080"
