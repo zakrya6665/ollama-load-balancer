@@ -565,7 +565,7 @@ app.get("/", (req, res) => {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>HexaSynq Gateway | HexaBiz Solutions</title>
+      <title>HexaSynq Gateway | Hexagon Bizolutions</title>
       <style>
         :root { --bg: #0a0a0f; --card: #13131f; --accent: #00f0ff; --text: #e0e0e0; --muted: #888899; }
         body { margin: 0; font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; }
@@ -580,13 +580,13 @@ app.get("/", (req, res) => {
     <body>
       <div class="container">
         <div class="logo">HexaSynq Gateway</div>
-        <div class="subtitle">Secure AI & WhatsApp Orchestration Layer by <strong>HexaBiz Solutions</strong></div>
+        <div class="subtitle">Secure AI & WhatsApp Orchestration Layer by <strong>Hexagon Bizolutions</strong></div>
         
         <div>
           <span class="badge">v2.3.7</span>
           <span class="badge">Node.js / Express</span>
-          <span class="badge">Evolution API v2</span>
-          <span class="badge">Ollama / FCM</span>
+          <span class="badge">WhatsApp API</span>
+          <span class="badge">LLM Engine/span>
         </div>
 
         <div style="margin-top: 2rem; text-align: left; background: rgba(0,0,0,0.3); padding: 1rem; border-radius: 8px; font-family: monospace; font-size: 0.85rem;">
@@ -596,7 +596,7 @@ app.get("/", (req, res) => {
         </div>
 
         <div class="footer">
-          &copy; ${new Date().getFullYear()} HexaBiz Solutions. All systems secured via HMAC-256 & End-to-End Encryption.
+          &copy; ${new Date().getFullYear()} Hexagon Bizolutions. All systems secured via End-to-End Encryption.
         </div>
       </div>
     </body>
@@ -613,9 +613,9 @@ app.get("/health", async (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     checks: {
-      evolution_api: "unknown",
-      ollama: "unknown",
-      firebase: isFirebaseReady ? "ok" : "degraded",
+      WhatsAPP_Integration: "unknown",
+      LLM_Engine: "unknown",
+      Push_Service: isFirebaseReady ? "ok" : "degraded",
     }
   };
 
@@ -623,25 +623,25 @@ app.get("/health", async (req, res) => {
   try {
     const evoRes = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/`, { method: "GET" });
     // 404 is fine, it just means the root path isn't a specific endpoint, but the server is responding
-    health.checks.evolution_api = evoRes.ok || evoRes.status === 404 ? "ok" : "degraded";
+    health.checks.WhatsAPP_Integration = evoRes.ok || evoRes.status === 404 ? "ok" : "degraded";
   } catch {
-    health.checks.evolution_api = "down";
+    health.checks.WhatsAPP_Integration = "down";
   }
 
   // Check Ollama (Primary Runner)
   if (AI_PROVIDER === "ollama" && RUNNERS.length > 0) {
     try {
       const ollamaRes = await fetchWithTimeout(`${RUNNERS[0].url}/api/tags`, { method: "GET" });
-      health.checks.ollama = ollamaRes.ok ? "ok" : "degraded";
+      health.checks.LLM_Engine = ollamaRes.ok ? "ok" : "degraded";
     } catch {
-      health.checks.ollama = "down";
+      health.checks.LLM_Engine = "down";
     }
   } else {
-    health.checks.ollama = "skipped";
+    health.checks.LLM_Engine = "skipped";
   }
 
   // Determine overall status
-  if (health.checks.evolution_api === "down" || health.checks.ollama === "down") {
+  if (health.checks.WhatsAPP_Integration === "down" || health.checks.LLM_Engine === "down") {
     health.status = "degraded";
     return res.status(503).json(health); // 503 tells Coolify to restart or alert
   }
