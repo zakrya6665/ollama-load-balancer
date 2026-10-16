@@ -46,6 +46,7 @@ services:
     volumes:
       # 👇 ADD THIS LINE (Read-Only mount) 👇
       - ./secrets/serviceAccountKey.json:/run/secrets/serviceAccountKey.json:ro
+      - ./gateway_data:/data
     depends_on:
       ollama:
         condition: service_healthy
