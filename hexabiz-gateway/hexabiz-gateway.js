@@ -329,41 +329,40 @@ function verifyHmac(req, res, next) {
   const timestampText = req.get("x-timestamp");
   const nonce = req.get("x-nonce");
 
-  if (!isValidDeviceId(id) || !signature || !/^[a-fA-F0-9]{64}$/.test(signature)
-      || !timestampText || !/^\d{10,13}$/.test(timestampText)
-      || !nonce || !/^[A-Za-z0-9._~-]{16,128}$/.test(nonce)) {
+  const fail = (reason) => {
+    console.warn(`[SECURITY] HMAC rejected reason=${reason} device=${id ?? "missing"} ip=${ipKey(req)}`);
     return res.status(401).json({ error: "Unauthorized" });
-  }
+  };
+
+  if (!isValidDeviceId(id)) return fail("invalid_device_id");
+  if (!signature || !/^[a-fA-F0-9]{64}$/.test(signature)) return fail("invalid_signature_format");
+  if (!timestampText || !/^\d{10,13}$/.test(timestampText)) return fail("invalid_timestamp_format");
+  if (!nonce || !/^[A-Za-z0-9._~-]{16,128}$/.test(nonce)) return fail("invalid_nonce_format");
 
   const timestamp = Number(timestampText);
   const timestampSeconds = timestamp > 9_999_999_999 ? Math.floor(timestamp / 1000) : timestamp;
   if (Math.abs(Math.floor(Date.now() / 1000) - timestampSeconds) > HMAC_MAX_SKEW_SECONDS) {
-    return res.status(401).json({ error: "Signature expired" });
+    return fail("signature_expired");
   }
 
   const secret = deviceSecret(id);
   const raw = req.rawBody ? req.rawBody.toString("utf8") : "";
-  const expected = crypto.createHmac("sha256", secret).update(`${timestampText}.${nonce}.${raw}`, "utf8").digest("hex");
-  
-  if (!safeEqualText(signature.toLowerCase(), expected)) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  const expected = crypto.createHmac("sha256", secret)
+    .update(`${timestampText}.${nonce}.${raw}`, "utf8")
+    .digest("hex");
+
+  if (!safeEqualText(signature.toLowerCase(), expected)) return fail("signature_mismatch");
 
   const nonceKey = `${id}:${nonce}`;
   const now = Date.now();
-  
-  for (const [key, expiry] of consumedNonces) {
-    if (expiry <= now) consumedNonces.delete(key);
-  }
-  
-  if (consumedNonces.has(nonceKey)) {
-    return res.status(401).json({ error: "Replay detected" });
-  }
-  
+  for (const [key, expiry] of consumedNonces) if (expiry <= now) consumedNonces.delete(key);
+  if (consumedNonces.has(nonceKey)) return fail("replay_detected");
+
   consumedNonces.set(nonceKey, now + HMAC_MAX_SKEW_SECONDS * 1000);
   evictOldest(consumedNonces, MAX_NONCES);
 
   if (!checkWindow(deviceRateLimits, id, MAX_REQUESTS_PER_WINDOW, RATE_LIMIT_WINDOW_MS)) {
+    console.warn(`[SECURITY] Rate limit exceeded device=${id}`);
     return res.status(429).json({ error: "Too many requests" });
   }
 
