@@ -41,11 +41,8 @@ services:
       HMAC_MAX_SKEW_SECONDS: 60
       OUTBOUND_TIMEOUT_MS: 120000
       MAX_PROMPT_LENGTH: 12000
-      # 👇 ADD THIS LINE 👇
-      FIREBASE_SERVICE_ACCOUNT_PATH: "/run/secrets/serviceAccountKey.json"
+      FIREBASE_SERVICE_ACCOUNT_PATH: "/data/serviceAccountKey.json"
     volumes:
-      # 👇 ADD THIS LINE (Read-Only mount) 👇
-      - ./secrets/serviceAccountKey.json:/run/secrets/serviceAccountKey.json:ro
       - ./gateway_data:/data
     depends_on:
       ollama:
