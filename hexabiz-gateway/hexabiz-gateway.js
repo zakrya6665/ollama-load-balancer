@@ -938,33 +938,59 @@ app.post("/api/instance/create", verifyEnrollment, async (req, res) => {
 
 app.post("/api/device/fcm", verifyHmac, async (req, res) => {
   const token = req.body?.fcmToken;
-  const claimed = req.body?.instanceName || req.get("x-instance-name") || deviceToInstance.get(req.deviceId);
-  
+
   if (typeof token !== "string" || token.length < 10 || token.length > 4096) {
+    console.warn(`[FCM] Rejected invalid token from device=${req.deviceId}`);
     return res.status(400).json({ error: "Invalid FCM token" });
   }
-  
-  let verifiedInstance = null;
-  if (claimed) {
-    if (!isValidInstanceName(claimed)) return res.status(400).json({ error: "Invalid instance name" });
-    const access = await instanceAccess(claimed, req.deviceToken);
-    if (access === "foreign") return res.status(403).json({ error: "This device does not own that instance" });
-    if (access === "missing") return res.status(404).json({ error: "Instance does not exist" });
-    if (access !== "owned") return res.status(502).json({ error: "Could not verify instance ownership" });
-    
-    const owner = instanceToDevice.get(claimed);
-    if (owner && owner !== req.deviceId) return res.status(409).json({ error: "Instance mapping conflict" });
-    const prior = deviceToInstance.get(req.deviceId);
-    if (prior && prior !== claimed) return res.status(409).json({ error: "Device is already mapped to another instance" });
-    verifiedInstance = claimed;
-  }
-  
+
+  // 1. ALWAYS persist the token first. Never lose it to a link-ordering race.
   deviceTokens.set(req.deviceId, token);
-  if (verifiedInstance) attachMapping(verifiedInstance, req.deviceId);
   scheduleSave();
-  
-  console.log(`[FCM] Registered token for device=${req.deviceId} instance=${verifiedInstance || "unlinked"}`);
-  return res.status(200).json({ success: true, instanceName: verifiedInstance });
+
+  const claimed = req.body?.instanceName
+    || req.get("x-instance-name")
+    || deviceToInstance.get(req.deviceId);
+
+  // 2. No instance yet → token is safe. /api/instance/create will bind it later.
+  if (!claimed) {
+    console.log(`[FCM] ✅ Token stored for device=${req.deviceId} (unlinked; will bind on create).`);
+    return res.status(200).json({ success: true, linked: false, instanceName: null });
+  }
+
+  if (!isValidInstanceName(claimed)) {
+    return res.status(400).json({ error: "Invalid instance name" });
+  }
+
+  // 3. Verify ownership before attaching anything.
+  const access = await instanceAccess(claimed, req.deviceToken);
+
+  if (access === "missing") {
+    // Token is already stored. Tell the client to retry after creating the instance.
+    console.log(`[FCM] ⏳ Token stored for device=${req.deviceId}; instance=${claimed} not created yet.`);
+    return res.status(202).json({ success: true, linked: false, reason: "instance_not_created_yet" });
+  }
+  if (access === "foreign") {
+    return res.status(403).json({ error: "This device does not own that instance" });
+  }
+  if (access !== "owned") {
+    return res.status(502).json({ error: "Could not verify instance ownership" });
+  }
+
+  const owner = instanceToDevice.get(claimed);
+  if (owner && owner !== req.deviceId) {
+    return res.status(409).json({ error: "Instance mapping conflict" });
+  }
+  const prior = deviceToInstance.get(req.deviceId);
+  if (prior && prior !== claimed) {
+    return res.status(409).json({ error: "Device is already mapped to another instance" });
+  }
+
+  // 4. attachMapping() copies deviceTokens → instanceTokens automatically.
+  attachMapping(claimed, req.deviceId);
+
+  console.log(`[FCM] ✅ Token stored AND linked: device=${req.deviceId} instance=${claimed}`);
+  return res.status(200).json({ success: true, linked: true, instanceName: claimed });
 });
 
 app.post("/api/instance/release", verifyHmac, async (req, res) => {
