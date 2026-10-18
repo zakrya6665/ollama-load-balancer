@@ -10,6 +10,14 @@ import { getMessaging } from "firebase-admin/messaging";
 // ============================================================================
 // HexaSynq Gateway — Production-Ready Security & Orchestration Layer
 // Node.js 20+ | ES Modules | Hexagon Bizolutions
+//
+// FCM fixes applied (search "FIX:"):
+//   B1 sendFcm splits mapping_missing / token_missing
+//   B2 create logs whether an FCM token arrived
+//   B3 failed creates no longer burn the 24 h per-IP limit
+//   B4 jidToPhone no longer treats @lid as a phone number
+//   B5 POST /api/device/fcm/test sends a PING push to the calling device
+//   B6 startup check that the persistence directory is writable
 // ============================================================================
 function positiveInt(value, fallback) {
   const n = Number.parseInt(value ?? "", 10);
@@ -217,7 +225,7 @@ function writeMappings() {
   } catch (err) {
     // Graceful degradation: if FS is read-only (e.g., ephemeral container), log and continue in-memory
     console.warn(`[PERSISTENCE] Save failed (running in memory-only mode): ${err.message}`);
-    mappingsDirty = false; 
+    mappingsDirty = false;
   }
 }
 
@@ -266,7 +274,7 @@ function loadMappings() {
 function attachMapping(instanceName, deviceId, { allowMove = false } = {}) {
   const currentOwner = instanceToDevice.get(instanceName);
   const currentInstance = deviceToInstance.get(deviceId);
-  
+
   if (currentOwner && currentOwner !== deviceId && !allowMove) {
     throw new Error("Instance is already associated with another device");
   }
@@ -280,7 +288,7 @@ function attachMapping(instanceName, deviceId, { allowMove = false } = {}) {
   if (allowMove && currentOwner && currentOwner !== deviceId) {
     if (deviceToInstance.get(currentOwner) === instanceName) deviceToInstance.delete(currentOwner);
   }
-  
+
   instanceToDevice.set(instanceName, deviceId);
   deviceToInstance.set(deviceId, instanceName);
   const token = deviceTokens.get(deviceId);
@@ -298,6 +306,19 @@ function detachInstance(instanceName, expectedDeviceId) {
 }
 
 loadMappings();
+
+// FIX B6: tell the operator loudly if mappings/FCM tokens cannot survive a restart.
+try {
+  const persistDir = path.dirname(MAPPINGS_FILE);
+  fs.mkdirSync(persistDir, { recursive: true });
+  fs.accessSync(persistDir, fs.constants.W_OK);
+  console.log(`[PERSISTENCE] OK, writable: ${MAPPINGS_FILE}`);
+} catch (err) {
+  console.error(
+    `[PERSISTENCE] NOT WRITABLE (${err.message}). Mappings and FCM tokens will be LOST on every restart. ` +
+    `Mount a persistent volume at ${path.dirname(MAPPINGS_FILE)} and make it writable by the container user.`
+  );
+}
 
 function ipKey(req) {
   return String(req.ip || req.socket.remoteAddress || "unknown").replace(/^::ffff:/, "");
@@ -375,22 +396,22 @@ async function verifyPlayIntegrity(req, res, next) {
   if (!REQUIRE_PLAY_INTEGRITY) return next();
   const token = req.get("x-play-integrity-token");
   if (!token) return res.status(401).json({ error: "Play Integrity token required" });
-  
+
   try {
     const response = await fetchWithTimeout(PLAY_INTEGRITY_VERIFIER_URL, {
       method: "POST",
-      headers: { 
-        "Content-Type": "application/json", 
-        "Authorization": `Bearer ${process.env.PLAY_INTEGRITY_VERIFIER_KEY || ""}` 
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.PLAY_INTEGRITY_VERIFIER_KEY || ""}`
       },
       body: JSON.stringify({ token, packageName: process.env.ANDROID_PACKAGE_NAME || "" })
     });
-    
+
     if (!response.ok) {
       await discard(response);
       return res.status(401).json({ error: "Play Integrity verification failed" });
     }
-    
+
     const result = await response.json();
     if (result?.valid !== true) {
       await discard(response);
@@ -501,14 +522,14 @@ async function getInstanceState(name, secret) {
     }
     const data = await r.json();
     return data?.instance?.state ?? data?.state ?? null;
-  } catch { 
-    return null; 
+  } catch {
+    return null;
   }
 }
 
 async function configureWebhook(name) {
   const r = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/webhook/set/${encodeURIComponent(name)}`, {
-    method: "POST", 
+    method: "POST",
     headers: evolutionHeaders(EVOLUTION_GLOBAL_KEY, true),
     body: JSON.stringify({ webhook: webhookConfig() })
   });
@@ -575,7 +596,7 @@ function reserveAiSlot() {
     return Promise.resolve(makeSlotRelease());
   }
   if (aiWaiters.length >= MAX_QUEUE_SIZE) return Promise.resolve(null);
-  
+
   return new Promise((resolve) => {
     const waiter = { resolve, timer: null };
     waiter.timer = setTimeout(() => {
@@ -612,23 +633,23 @@ async function runOllama(payload, endpoint) {
   const runner = RUNNERS
     .filter((item) => item.active < MAX_CONCURRENT_PER_RUNNER)
     .sort((a, b) => a.active - b.active)[0];
-    
+
   if (!runner) {
     const err = new Error("No Ollama runner has available capacity");
     err.statusCode = 503;
     throw err;
   }
-  
+
   runner.active += 1;
   try {
     const response = await fetchWithTimeout(`${runner.url}${endpoint}`, {
-      method: "POST", 
+      method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...payload, model: MODEL_NAME, stream: false })
     });
     let data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(`Ollama returned HTTP ${response.status}`);
-    
+
     // Normalise /api/generate ({ response }) to the same shape as /api/chat ({ message }).
     if (endpoint === "/api/generate" && typeof data?.response === "string") {
       data = { ...data, message: { role: "assistant", content: data.response } };
@@ -657,19 +678,19 @@ async function callPollinations(promptOrMessages) {
   if (!POLLINATIONS_API_KEY || !POLLINATIONS_BASE_URL) throw new Error("Pollinations fallback is not configured");
   const prompt = extractPrompt(promptOrMessages, MAX_PROMPT_LENGTH);
   if (!prompt.trim()) throw new Error("Prompt is empty");
-  
+
   const response = await fetchWithTimeout(POLLINATIONS_BASE_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${POLLINATIONS_API_KEY}` },
     body: JSON.stringify({ model: FALLBACK_MODEL, messages: [{ role: "user", content: prompt }] })
   });
-  
+
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(`Pollinations returned HTTP ${response.status}`);
-  
+
   const content = data?.choices?.[0]?.message?.content?.trim();
   if (!content) throw new Error("Pollinations returned an empty response");
-  
+
   return { source: "Pollinations-Fallback", data: { message: { role: "assistant", content } } };
 }
 
@@ -685,8 +706,8 @@ async function runAi(messages, prompt) {
         console.error(`[AI] Ollama failed: ${err.message}`);
       }
     }
-    try { 
-      return await callPollinations(messages || prompt); 
+    try {
+      return await callPollinations(messages || prompt);
     } catch (err) {
       const combined = new Error(`AI providers failed: ${primaryError?.message || "primary unavailable"}; fallback: ${err.message}`);
       combined.statusCode = 502;
@@ -700,7 +721,8 @@ async function runAi(messages, prompt) {
 // ----------------------------------------------------------------------------
 function jidToPhone(jid) {
   if (typeof jid !== "string") return null;
-  const match = jid.match(/^(\d{8,15})(?::\d+)?@(?:s\.whatsapp\.net|c\.us|lid|hosted\.lid)$/i);
+  // FIX B4: only real phone-number JIDs. A @lid is an internal WhatsApp id, NOT a phone number.
+  const match = jid.match(/^(\d{8,15})(?::\d+)?@(?:s\.whatsapp\.net|c\.us)$/i);
   return match?.[1] ?? null;
 }
 
@@ -763,16 +785,24 @@ function payloadTextBudget(payload) {
 async function sendFcm(instanceName, payload) {
   const deviceId = instanceToDevice.get(instanceName);
   const token = (deviceId && deviceTokens.get(deviceId)) || instanceTokens.get(instanceName);
-  
-  if (!deviceId || !token) {
-    console.warn(`[FCM] No verified FCM mapping for instance ${instanceName}; delivery skipped.`);
+
+  // FIX B1: say which problem it really is.
+  if (!deviceId) {
+    console.warn(`[FCM] No instance->device mapping for ${instanceName}; delivery skipped.`);
     return { sent: false, reason: "mapping_missing" };
+  }
+  if (!token) {
+    console.warn(
+      `[FCM] ${instanceName} is mapped to device=${deviceId} but the device has NO FCM token ` +
+      `(never registered, or purged after a failed send); delivery skipped.`
+    );
+    return { sent: false, reason: "token_missing" };
   }
   if (!firebaseReady) {
     console.error(`[FCM] Firebase unavailable; delivery skipped for ${instanceName}.`);
     return { sent: false, reason: "firebase_unavailable" };
   }
-  
+
   const data = payloadTextBudget(Object.fromEntries(Object.entries(payload).map(([k, v]) => [k, String(v ?? "")])));
   try {
     await getMessaging().send({ token, data, android: { priority: "high" } });
@@ -781,6 +811,7 @@ async function sendFcm(instanceName, payload) {
   } catch (err) {
     console.error(`[FCM] Send failed instance=${instanceName} device=${deviceId} code=${err.code || "unknown"} message=${err.message}`);
     if (["messaging/invalid-registration-token", "messaging/registration-token-not-registered"].includes(err.code)) {
+      console.warn(`[FCM] Token for device=${deviceId} is stale and was purged. The app must re-register (open it, or wait for its periodic worker).`);
       if (deviceTokens.get(deviceId) === token) deviceTokens.delete(deviceId);
       if (instanceTokens.get(instanceName) === token) instanceTokens.delete(instanceName);
       scheduleSave();
@@ -816,15 +847,15 @@ app.get("/health", async (_req, res) => {
     ollama: AI_PROVIDER === "ollama" ? "unknown" : "skipped",
     firebase: firebaseReady ? "ok" : "down"
   };
-  
+
   try {
     const response = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/`, {}, 5000);
     checks.evolution_api = response.ok || response.status === 404 ? "ok" : "degraded";
     await discard(response);
-  } catch { 
-    checks.evolution_api = "down"; 
+  } catch {
+    checks.evolution_api = "down";
   }
-  
+
   if (AI_PROVIDER === "ollama") {
     if (!RUNNERS.length) {
       checks.ollama = "down";
@@ -833,34 +864,45 @@ app.get("/health", async (_req, res) => {
         const response = await fetchWithTimeout(`${RUNNERS[0].url}/api/tags`, {}, 5000);
         checks.ollama = response.ok ? "ok" : "degraded";
         await discard(response);
-      } catch { 
-        checks.ollama = "down"; 
+      } catch {
+        checks.ollama = "down";
       }
     }
   }
-  
+
   const required = [checks.evolution_api, checks.firebase, ...(AI_PROVIDER === "ollama" ? [checks.ollama] : [])];
   const status = required.every((value) => value === "ok" || value === "skipped") ? "ok" : "degraded";
   res.status(status === "ok" ? 200 : 503).json({ status, timestamp: new Date().toISOString(), uptime: process.uptime(), checks });
 });
 
 app.post("/api/instance/create", verifyEnrollment, async (req, res) => {
-  if (!checkWindow(createRateLimits, ipKey(req), INSTANCE_CREATE_LIMIT, 24 * 60 * 60 * 1000)) {
+  // FIX B3: failed attempts (status >= 400) are refunded so they cannot lock a shared network out.
+  const ip = ipKey(req);
+  if (!checkWindow(createRateLimits, ip, INSTANCE_CREATE_LIMIT, 24 * 60 * 60 * 1000)) {
     return res.status(429).json({ error: "Instance creation limit reached for this network. Try again later." });
   }
-  
+  res.on("finish", () => {
+    if (res.statusCode >= 400) {
+      const entry = createRateLimits.get(ip);
+      if (entry && entry.count > 0) entry.count -= 1;
+    }
+  });
+
   const { deviceId, fcmToken } = req.body ?? {};
   const phone = normalizePhone(req.body?.phoneNumber);
   const wantsPairing = req.body?.usePairingCode === true;
-  
+
   if (!isValidDeviceId(deviceId)) return res.status(400).json({ error: "Invalid device ID" });
   if (!phone) return res.status(400).json({ error: "Invalid phone number; use country code and 8–15 digits." });
   if (fcmToken != null && (typeof fcmToken !== "string" || fcmToken.length < 10 || fcmToken.length > 4096)) {
     return res.status(400).json({ error: "Invalid FCM token" });
   }
-  
+
   const name = deriveInstanceName(phone);
   const secret = deviceSecret(deviceId);
+
+  // FIX B2: make it obvious in the logs whether the app sent a token at enrollment.
+  console.log(`[CREATE] ${name} device=${deviceId} hasFcmToken=${Boolean(fcmToken)} pairing=${wantsPairing}`);
 
   // Local mapping conflicts are checked BEFORE touching Evolution
   const existingOwner = instanceToDevice.get(name);
@@ -868,7 +910,7 @@ app.post("/api/instance/create", verifyEnrollment, async (req, res) => {
     const access = await instanceAccess(name, secret);
     if (access !== "owned") return res.status(409).json({ error: "This number is linked to a different device." });
   }
-  
+
   const priorInstance = deviceToInstance.get(deviceId);
   if (priorInstance && priorInstance !== name) {
     return res.status(409).json({ error: "This device is already linked to a different instance. Release it first." });
@@ -880,7 +922,7 @@ app.post("/api/instance/create", verifyEnrollment, async (req, res) => {
     rejectCall: false, webhook: webhookConfig()
   };
   if (wantsPairing) requestBody.number = phone;
-  
+
   try {
     const response = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/create`, {
       method: "POST", headers: evolutionHeaders(EVOLUTION_GLOBAL_KEY, true), body: JSON.stringify(requestBody)
@@ -888,14 +930,14 @@ app.post("/api/instance/create", verifyEnrollment, async (req, res) => {
     const body = await response.json().catch(() => ({}));
     let created = response.ok;
     let reused = false;
-    
+
     if (!created && [400, 403, 409].includes(response.status) && /already|exists|in use/i.test(JSON.stringify(body))) {
       const access = await instanceAccess(name, secret);
       if (access === "owned") { created = true; reused = true; }
       else if (access === "foreign") return res.status(409).json({ error: "This number is linked to a different device." });
       else return res.status(502).json({ error: "Could not verify the existing instance." });
     }
-    
+
     if (!created) {
       console.warn(`[CREATE] Evolution rejected ${name}: HTTP ${response.status}`);
       return res.status(502).json({ error: "Evolution API rejected instance creation", details: body?.message || body?.error || null });
@@ -920,11 +962,11 @@ app.post("/api/instance/create", verifyEnrollment, async (req, res) => {
 
     try { await configureWebhook(name); }
     catch (err) { console.error(`[WEBHOOK] Configure failed for ${name}: ${err.message}`); }
-    
+
     let pairingCode = body?.qrcode?.pairingCode ?? body?.pairingCode ?? null;
     if (wantsPairing && !pairingCode) pairingCode = await requestPairingCode(name, secret, phone);
     const state = reused ? await getInstanceState(name, secret) : null;
-    
+
     return res.status(reused ? 200 : 201).json({
       instanceName: name, deviceSecret: secret, pairingCode,
       ...(reused ? { alreadyExisted: true, connectionState: state } : {})
@@ -992,10 +1034,18 @@ app.post("/api/device/fcm", verifyHmac, async (req, res) => {
   return res.status(200).json({ success: true, linked: true, instanceName: claimed });
 });
 
+// FIX B5: end-to-end proof. Sends a PING data message to the calling device.
+app.post("/api/device/fcm/test", verifyHmac, async (req, res) => {
+  const name = deviceToInstance.get(req.deviceId);
+  if (!name) return res.status(404).json({ error: "Device is not linked to an instance" });
+  const result = await sendFcm(name, { type: "PING", sentAt: String(Date.now()) });
+  return res.status(result.sent ? 200 : 409).json(result);
+});
+
 app.post("/api/instance/release", verifyHmac, async (req, res) => {
   const name = resolveInstanceName(req);
   if (!name) return res.status(400).json({ error: "Invalid instance name" });
-  
+
   const access = await instanceAccess(name, req.deviceToken);
   if (access === "missing") {
     detachInstance(name, req.deviceId);
@@ -1003,7 +1053,7 @@ app.post("/api/instance/release", verifyHmac, async (req, res) => {
   }
   if (access === "foreign") return res.status(403).json({ error: "This device does not own that instance" });
   if (access !== "owned") return res.status(502).json({ error: "Could not verify instance ownership" });
-  
+
   try {
     const response = await deleteEvolutionInstance(name);
     if (!response.ok && response.status !== 404) {
@@ -1023,10 +1073,10 @@ app.post("/api/chat", verifyHmac, verifyPlayIntegrity, async (req, res) => {
   const body = req.body ?? {};
   const messages = body.messages == null ? null : validateMessages(body.messages);
   const prompt = typeof body.prompt === "string" ? body.prompt.slice(0, MAX_PROMPT_LENGTH) : "";
-  
+
   if (body.messages != null && !messages) return res.status(400).json({ error: "Invalid or oversized messages array" });
   if (!messages && !prompt.trim()) return res.status(400).json({ error: "A prompt or valid messages array is required" });
-  
+
   try {
     const result = await runAi(messages, prompt);
     return res.status(200).json(result);
@@ -1040,12 +1090,12 @@ app.post("/api/chat", verifyHmac, verifyPlayIntegrity, async (req, res) => {
 app.get("/api/instance/status", verifyHmac, async (req, res) => {
   const name = resolveInstanceName(req);
   if (!name) return res.status(400).json({ error: "Invalid instance name" });
-  
+
   const access = await instanceAccess(name, req.deviceToken);
   if (access === "foreign") return res.status(403).json({ error: "This device does not own that instance" });
   if (access === "missing") return res.status(404).json({ error: "Instance not found" });
   if (access !== "owned") return res.status(502).json({ error: "Could not verify instance ownership" });
-  
+
   try {
     const response = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/connectionState/${encodeURIComponent(name)}`, {
       headers: evolutionHeaders(req.deviceToken)
@@ -1062,32 +1112,32 @@ app.post("/webhook/evolution", verifyWebhook, async (req, res) => {
   const payload = req.body ?? {};
   const instanceName = payload.instance || payload.instanceName;
   const event = String(payload.event ?? "").toLowerCase().replace(/_/g, ".");
-  
+
   if (!isValidInstanceName(instanceName)) return res.status(400).json({ error: "Invalid instance in webhook" });
   if (!instanceToDevice.has(instanceName)) {
     console.warn(`[WEBHOOK] No local device mapping for instance=${instanceName}`);
     return res.status(200).json({ success: true, ignored: "mapping_missing" });
   }
-  
+
   try {
     const items = eventItems(payload);
-    
+
     if (event === "messages.upsert") {
       for (const item of items) {
         const key = item?.key;
         if (!key) continue;
-        
+
         const messageId = String(key.id || "");
         const dedupeId = messageId ? `upsert:${messageId}:${Boolean(key.fromMe)}` : null;
         if (dedupeId && webhookAlreadyDelivered(instanceName, dedupeId)) continue;
-        
-        const jid = key.remoteJidAlt || key.senderPn || key.remoteJid;
-        const phone = jidToPhone(jid);
+
+        // Prefer the phone-number JID. With FIX B4, an unresolved @lid is skipped, not turned into a fake number.
+        const phone = jidToPhone(key.remoteJidAlt) || jidToPhone(key.senderPn) || jidToPhone(key.remoteJid);
         if (!phone) {
-          console.info(`[WEBHOOK] Skipped unresolved JID instance=${instanceName} jidType=${typeof jid} fromMe=${Boolean(key.fromMe)}`);
+          console.info(`[WEBHOOK] Skipped unresolved JID instance=${instanceName} remoteJid=${String(key.remoteJid || "").split("@")[1] || "none"} fromMe=${Boolean(key.fromMe)}`);
           continue;
         }
-        
+
         const protocol = item?.message?.protocolMessage;
         if (protocol && [0, 7, "REVOKE"].includes(protocol.type)) {
           const deletedId = protocol.key?.id;
@@ -1099,17 +1149,17 @@ app.post("/webhook/evolution", verifyWebhook, async (req, res) => {
           }
           continue;
         }
-        
+
         const text = extractMessageText(item?.message);
         const message = item?.message || {};
         const isMedia = Boolean(message.imageMessage || message.videoMessage || message.audioMessage
           || message.documentMessage || message.stickerMessage || message.ptvMessage);
-          
+
         if (!text && !isMedia) {
           console.info(`[WEBHOOK] Skipped unsupported message type instance=${instanceName} messageId=${messageId || "none"}`);
           continue;
         }
-        
+
         const result = await sendFcm(instanceName, {
           type: key.fromMe ? "SENT_WHATSAPP_MESSAGE" : "NEW_WHATSAPP_MESSAGE",
           phoneNumber: phone,
@@ -1163,7 +1213,7 @@ app.post("/webhook/evolution", verifyWebhook, async (req, res) => {
         instanceName
       });
     }
-    
+
     return res.status(200).json({ success: true });
   } catch (err) {
     console.error(`[WEBHOOK] Processing failed event=${event} instance=${instanceName}: ${err.message}`);
@@ -1222,17 +1272,17 @@ async function shutdown(signal) {
   console.log(`[SHUTDOWN] Received ${signal}; closing server gracefully.`);
   clearInterval(cleanupTimer);
   if (saveTimer) clearTimeout(saveTimer);
-  
+
   if (mappingsDirty) {
-    try { writeMappings(); } 
+    try { writeMappings(); }
     catch (err) { console.error(`[PERSISTENCE] Final save failed: ${err.message}`); }
   }
-  
+
   server.close(() => {
     console.log("[SHUTDOWN] Server closed. Exiting.");
     process.exit(0);
   });
-  
+
   // Force exit if graceful shutdown hangs
   setTimeout(() => {
     console.error("[SHUTDOWN] Force exit after timeout.");
