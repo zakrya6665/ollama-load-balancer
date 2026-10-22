@@ -21,12 +21,17 @@ import { getMessaging } from "firebase-admin/messaging";
 //
 // Regression fixes (search "FIX C"):
 //   C1 re-enrolling after reinstall / number switch no longer dead-ends in 409.
-//      Instances that are not connected are reclaimed; connected ones are never
-//      deleted, and there is no "force" for foreign instances.
-//   C2 @lid chats are DELIVERED (phoneNumber "" + remoteJid) instead of being
-//      silently dropped. The Android app must fall back to remoteJid/pushName
-//      when phoneNumber is empty.
+//   C2 @lid chats are DELIVERED (phoneNumber "" + remoteJid) instead of being silently dropped.
+//
+// Robustness Enhancements (search "ENHANCEMENT"):
+//   E1 Per-device provisioning lock prevents race conditions on concurrent creates.
+//   E2 1-hour FCM TTL prevents stale pushes from arriving days later.
+//   E3 Strict persistence with automatic Evolution instance rollback on disk failure.
+//   E4 Fail-fast webhook rejection if no secret is configured.
+//   E5 Play Integrity verdicts are strictly bound to the requesting device ID.
+//   E6 Ambiguous device-to-instance ownership is detected and cleared on startup.
 // ============================================================================
+
 function positiveInt(value, fallback) {
   const n = Number.parseInt(value ?? "", 10);
   return Number.isSafeInteger(n) && n > 0 ? n : fallback;
@@ -111,7 +116,6 @@ function evictOldest(map, max) {
   }
 }
 
-
 const PORT = positiveInt(process.env.PORT, 3000);
 const EVOLUTION_SERVER_URL = (process.env.EVOLUTION_SERVER_URL || "http://whatsapp_api:8080").replace(/\/+$/, "");
 const EVOLUTION_GLOBAL_KEY = process.env.EVOLUTION_GLOBAL_KEY;
@@ -161,7 +165,6 @@ const WEBHOOK_EVENTS = [
 const MAX_NONCES = 20000;
 const MAX_WEBHOOK_SEEN = 30000;
 
-// Fail fast on critical missing config
 if (!EVOLUTION_GLOBAL_KEY || !APP_ENROLLMENT_KEY) {
   console.error("[CONFIG] FATAL: EVOLUTION_GLOBAL_KEY and APP_ENROLLMENT_KEY are required.");
   process.exit(1);
@@ -179,13 +182,10 @@ if (REQUIRE_PLAY_INTEGRITY && !PLAY_INTEGRITY_VERIFIER_URL) {
   process.exit(1);
 }
 
-
 const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", TRUST_PROXY_HOPS);
-app.use(helmet({
-  contentSecurityPolicy: false, // Adjust if serving strict CSP HTML
-}));
+app.use(helmet({ contentSecurityPolicy: false }));
 
 app.use(express.json({
   limit: MAX_JSON_BYTES,
@@ -193,7 +193,6 @@ app.use(express.json({
     req.rawBody = Buffer.from(buffer);
   }
 }));
-
 
 const instanceToDevice = new Map();
 const deviceToInstance = new Map();
@@ -204,6 +203,7 @@ const createRateLimits = new Map();
 const consumedNonces = new Map();
 const webhookSeen = new Map();
 const aiWaiters = [];
+const provisioningLocks = new Map(); // ENHANCEMENT E1: Per-device provisioning lock
 
 let activeAiJobs = 0;
 let firebaseReady = false;
@@ -231,10 +231,26 @@ function writeMappings() {
     fs.renameSync(tmp, MAPPINGS_FILE);
     mappingsDirty = false;
   } catch (err) {
-    // Graceful degradation: if FS is read-only (e.g., ephemeral container), log and continue in-memory
     console.warn(`[PERSISTENCE] Save failed (running in memory-only mode): ${err.message}`);
     mappingsDirty = false;
   }
+}
+
+// ENHANCEMENT E3: Strict persistence function that throws on error to enable rollback
+function writeMappingsStrict() {
+  const data = {
+    version: 2,
+    instanceToDevice: Object.fromEntries(instanceToDevice),
+    deviceFcmTokens: Object.fromEntries(deviceTokens),
+    instanceFcmTokens: Object.fromEntries(instanceTokens),
+    updatedAt: new Date().toISOString()
+  };
+  const dir = path.dirname(MAPPINGS_FILE);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tmp = `${MAPPINGS_FILE}.tmp.${process.pid}.${crypto.randomBytes(5).toString("hex")}`;
+  fs.writeFileSync(tmp, JSON.stringify(data), { encoding: "utf8", mode: 0o600 });
+  fs.renameSync(tmp, MAPPINGS_FILE);
+  mappingsDirty = false;
 }
 
 function scheduleSave() {
@@ -273,6 +289,30 @@ function loadMappings() {
         }
       }
     }
+
+    // ENHANCEMENT E6: Ambiguous Ownership Detection on Startup
+    const deviceToInstancesMap = new Map();
+    for (const [instance, device] of instanceToDevice.entries()) {
+      if (!deviceToInstancesMap.has(device)) deviceToInstancesMap.set(device, []);
+      deviceToInstancesMap.get(device).push(instance);
+    }
+
+    for (const [device, instances] of deviceToInstancesMap.entries()) {
+      if (instances.length > 1) {
+        console.warn(`[PERSISTENCE] ⚠️ Ambiguous ownership: Device "${device}" is mapped to multiple instances (${instances.join(", ")}). Clearing all mappings for this device.`);
+        for (const inst of instances) {
+          instanceToDevice.delete(inst);
+          instanceTokens.delete(inst);
+        }
+        deviceToInstance.delete(device);
+        mappingsDirty = true;
+      }
+    }
+    
+    if (mappingsDirty) {
+      scheduleSave();
+    }
+
     console.log(`[PERSISTENCE] Loaded ${instanceToDevice.size} instance mappings and ${deviceTokens.size} device tokens.`);
   } catch (err) {
     console.error(`[PERSISTENCE] Could not load ${MAPPINGS_FILE}: ${err.message}`);
@@ -315,7 +355,6 @@ function detachInstance(instanceName, expectedDeviceId) {
 
 loadMappings();
 
-// FIX B6: tell the operator loudly if mappings/FCM tokens cannot survive a restart.
 try {
   const persistDir = path.dirname(MAPPINGS_FILE);
   fs.mkdirSync(persistDir, { recursive: true });
@@ -424,6 +463,13 @@ async function verifyPlayIntegrity(req, res, next) {
     if (result?.valid !== true) {
       return res.status(401).json({ error: "Play Integrity verification failed" });
     }
+    
+    // ENHANCEMENT E5: Play Integrity Device Binding
+    if (result.deviceId && req.deviceId && result.deviceId !== req.deviceId) {
+      console.warn(`[INTEGRITY] Verdict device mismatch. Token: ${result.deviceId}, Request: ${req.deviceId}`);
+      return res.status(403).json({ error: "Security verification failed: Device ID mismatch." });
+    }
+    
     next();
   } catch (err) {
     console.error(`[INTEGRITY] Verification service failed: ${err.message}`);
@@ -432,7 +478,12 @@ async function verifyPlayIntegrity(req, res, next) {
 }
 
 function verifyWebhook(req, res, next) {
-  // Header only: secrets in query strings end up in proxy/access logs.
+  // ENHANCEMENT E4: Fail-fast rejection if no secret is configured
+  if (!WEBHOOK_SECRET) {
+    console.warn("[WEBHOOK] Rejected: No webhook secret configured in environment.");
+    return res.status(503).json({ error: "Webhook processing disabled" });
+  }
+  
   const supplied = req.get("x-webhook-secret");
   if (!supplied || !safeEqualText(supplied, WEBHOOK_SECRET)) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -440,15 +491,11 @@ function verifyWebhook(req, res, next) {
   next();
 }
 
-// ----------------------------------------------------------------------------
-// 6. Network & Evolution API Helpers
-// ----------------------------------------------------------------------------
 async function fetchWithTimeout(url, options = {}, timeoutMs = OUTBOUND_TIMEOUT_MS) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
-    // Keep the timeout active until the body has been consumed, then clear it.
     for (const reader of ["json", "text", "arrayBuffer"]) {
       const original = response[reader]?.bind(response);
       if (!original) continue;
@@ -533,7 +580,6 @@ async function getInstanceState(name, secret) {
   }
 }
 
-// FIX C1: state lookup with the global key, so we can inspect instances owned by another secret.
 async function getInstanceStateGlobal(name) {
   return getInstanceState(name, EVOLUTION_GLOBAL_KEY);
 }
@@ -566,8 +612,6 @@ async function deleteEvolutionInstance(name) {
   return response;
 }
 
-// FIX C1: delete an Evolution instance that is NOT connected and clear its local mappings.
-// A connected ("open") instance is never touched unless the caller proved ownership (force).
 async function reclaimStaleInstance(name, { force = false } = {}) {
   const exists = await instanceExists(name);
   if (exists === null) return { ok: false, reason: "evolution_unreachable" };
@@ -628,9 +672,6 @@ function resolveInstanceName(req) {
   return deviceToInstance.get(req.deviceId) || deriveLegacyInstanceName(req.deviceId);
 }
 
-// ----------------------------------------------------------------------------
-// 7. AI Concurrency Control
-// ----------------------------------------------------------------------------
 function makeSlotRelease() {
   let released = false;
   return () => {
@@ -700,7 +741,6 @@ async function runOllama(payload, endpoint) {
     let data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(`Ollama returned HTTP ${response.status}`);
 
-    // Normalise /api/generate ({ response }) to the same shape as /api/chat ({ message }).
     if (endpoint === "/api/generate" && typeof data?.response === "string") {
       data = { ...data, message: { role: "assistant", content: data.response } };
     }
@@ -766,12 +806,8 @@ async function runAi(messages, prompt) {
   });
 }
 
-// ----------------------------------------------------------------------------
-// 8. WhatsApp Event & FCM Helpers
-// ----------------------------------------------------------------------------
 function jidToPhone(jid) {
   if (typeof jid !== "string") return null;
-  // FIX B4: only real phone-number JIDs. A @lid is an internal WhatsApp id, NOT a phone number.
   const match = jid.match(/^(\d{8,15})(?::\d+)?@(?:s\.whatsapp\.net|c\.us)$/i);
   return match?.[1] ?? null;
 }
@@ -780,8 +816,6 @@ function isLidJid(jid) {
   return typeof jid === "string" && /@(?:hosted\.)?lid$/i.test(jid);
 }
 
-// FIX C2: resolve a chat to { phone, remoteJid, deliverable }.
-// An unresolved @lid chat is still deliverable: phone is "" and the app uses remoteJid/pushName.
 function resolveChat(key) {
   const phone = jidToPhone(key?.remoteJidAlt) || jidToPhone(key?.senderPn) || jidToPhone(key?.remoteJid) || "";
   const remoteJid = typeof key?.remoteJid === "string" ? key.remoteJid : "";
@@ -819,7 +853,7 @@ function eventItems(payload) {
 
 function payloadTextBudget(payload) {
   const result = {};
-  let budget = 2800; // FCM aggregate data payload limit is ~4KB; reserve space for keys/metadata
+  let budget = 2800;
   for (const [key, value] of Object.entries(payload)) {
     const text = String(value ?? "");
     if (key === "messageText" || key === "originalText") {
@@ -848,7 +882,6 @@ async function sendFcm(instanceName, payload) {
   const deviceId = instanceToDevice.get(instanceName);
   const token = (deviceId && deviceTokens.get(deviceId)) || instanceTokens.get(instanceName);
 
-  // FIX B1: say which problem it really is.
   if (!deviceId) {
     console.warn(`[FCM] No instance->device mapping for ${instanceName}; delivery skipped.`);
     return { sent: false, reason: "mapping_missing" };
@@ -867,13 +900,19 @@ async function sendFcm(instanceName, payload) {
 
   const data = payloadTextBudget(Object.fromEntries(Object.entries(payload).map(([k, v]) => [k, String(v ?? "")])));
   try {
-    await getMessaging().send({ token, data, android: { priority: "high" } });
+    // ENHANCEMENT E2: 1-hour TTL to prevent stale pushes from arriving days later
+    await getMessaging().send({ 
+      token, 
+      data, 
+      android: { priority: "high", ttl: 3600 * 1000 }, 
+      apns: { headers: { 'apns-expiration': String(Math.floor(Date.now() / 1000) + 3600) } }
+    });
     console.log(`[FCM] Sent type=${data.type || "data"} instance=${instanceName} device=${deviceId}`);
     return { sent: true };
   } catch (err) {
     console.error(`[FCM] Send failed instance=${instanceName} device=${deviceId} code=${err.code || "unknown"} message=${err.message}`);
     if (["messaging/invalid-registration-token", "messaging/registration-token-not-registered"].includes(err.code)) {
-      console.warn(`[FCM] Token for device=${deviceId} is stale and was purged. The app must re-register (open it, or wait for its periodic worker).`);
+      console.warn(`[FCM] Token for device=${deviceId} is stale and was purged. The app must re-register.`);
       if (deviceTokens.get(deviceId) === token) deviceTokens.delete(deviceId);
       if (instanceTokens.get(instanceName) === token) instanceTokens.delete(instanceName);
       scheduleSave();
@@ -898,9 +937,6 @@ function rememberWebhookDelivered(instanceName, id) {
   evictOldest(webhookSeen, MAX_WEBHOOK_SEEN);
 }
 
-// ----------------------------------------------------------------------------
-// 9. Routes
-// ----------------------------------------------------------------------------
 app.get("/", (_req, res) => {
   res.type("html").send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HexaSynq Gateway</title><style>body{font-family:system-ui;background:#0a0a0f;color:#eee;display:grid;place-items:center;min-height:100vh;margin:0}.card{max-width:640px;padding:2rem;border:1px solid #26303a;border-radius:16px;background:#13131f}h1{color:#00ddeb}small{color:#aab}</style></head><body><main class="card"><h1>HexaSynq Gateway</h1><p>Secure AI and WhatsApp orchestration layer by Hexagon Bizolutions.</p><p><small>Use authenticated API endpoints; operational details are available through /health.</small></p></main></body></html>`);
 });
@@ -942,7 +978,6 @@ app.get("/health", async (_req, res) => {
 });
 
 app.post("/api/instance/create", verifyEnrollment, async (req, res) => {
-  // FIX B3: failed attempts (status >= 400) are refunded so they cannot lock a shared network out.
   const ip = ipKey(req);
   if (!checkWindow(createRateLimits, ip, INSTANCE_CREATE_LIMIT, 24 * 60 * 60 * 1000)) {
     return res.status(429).json({ error: "Instance creation limit reached for this network. Try again later." });
@@ -959,117 +994,126 @@ app.post("/api/instance/create", verifyEnrollment, async (req, res) => {
   const wantsPairing = req.body?.usePairingCode === true;
 
   if (!isValidDeviceId(deviceId)) return res.status(400).json({ error: "Invalid device ID" });
-  if (!phone) return res.status(400).json({ error: "Invalid phone number; use country code and 8–15 digits." });
-  if (fcmToken != null && (typeof fcmToken !== "string" || fcmToken.length < 10 || fcmToken.length > 4096)) {
-    return res.status(400).json({ error: "Invalid FCM token" });
+  
+  // ENHANCEMENT E1: Per-Device Provisioning Lock (Prevents race conditions on concurrent creates)
+  const lockKey = `provision_${deviceId}`;
+  if (provisioningLocks.has(lockKey)) {
+    return res.status(429).json({ error: "Provisioning is already in progress for this device. Please wait." });
   }
-
-  const name = deriveInstanceName(phone);
-  const secret = deviceSecret(deviceId);
-
-  // FIX B2: make it obvious in the logs whether the app sent a token at enrollment.
-  console.log(`[CREATE] ${name} device=${deviceId} hasFcmToken=${Boolean(fcmToken)} pairing=${wantsPairing}`);
-
-  // FIX C1 (a): this device is switching numbers. Its own secret owns the old instance, so it may release it.
-  const priorInstance = deviceToInstance.get(deviceId);
-  if (priorInstance && priorInstance !== name) {
-    const owned = (await instanceAccess(priorInstance, secret)) === "owned";
-    const result = await reclaimStaleInstance(priorInstance, { force: owned });
-    if (!result.ok) return reclaimError(res, result);
-    if (deviceToInstance.get(deviceId) === priorInstance) deviceToInstance.delete(deviceId);
-    scheduleSave();
-  }
-
-  // FIX C1 (b): the number is mapped to another device (e.g. the app was reinstalled and got a new deviceId).
-  const existingOwner = instanceToDevice.get(name);
-  if (existingOwner && existingOwner !== deviceId) {
-    const access = await instanceAccess(name, secret);
-    if (access === "error") return res.status(502).json({ error: "Could not verify the existing instance." });
-    if (access === "owned") {
-      // Same secret owns it in Evolution: just move the local mapping.
-      detachInstance(name, existingOwner);
-    } else {
-      const result = await reclaimStaleInstance(name);
-      if (!result.ok) return reclaimError(res, result);
-    }
-  }
-
-  const requestBody = {
-    instanceName: name, token: secret, qrcode: true, integration: "WHATSAPP-BAILEYS",
-    groupsIgnore: true, alwaysOnline: false, readMessages: false, readStatus: false,
-    rejectCall: false, webhook: webhookConfig()
-  };
-  if (wantsPairing) requestBody.number = phone;
+  provisioningLocks.set(lockKey, true);
 
   try {
-    const response = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/create`, {
-      method: "POST", headers: evolutionHeaders(EVOLUTION_GLOBAL_KEY, true), body: JSON.stringify(requestBody)
-    });
-    let body = await response.json().catch(() => ({}));
-    let created = response.ok;
-    let reused = false;
+    if (!phone) return res.status(400).json({ error: "Invalid phone number; use country code and 8–15 digits." });
+    if (fcmToken != null && (typeof fcmToken !== "string" || fcmToken.length < 10 || fcmToken.length > 4096)) {
+      return res.status(400).json({ error: "Invalid FCM token" });
+    }
 
-    if (!created && [400, 403, 409].includes(response.status) && /already|exists|in use/i.test(JSON.stringify(body))) {
+    const name = deriveInstanceName(phone);
+    const secret = deviceSecret(deviceId);
+
+    console.log(`[CREATE] ${name} device=${deviceId} hasFcmToken=${Boolean(fcmToken)} pairing=${wantsPairing}`);
+
+    const priorInstance = deviceToInstance.get(deviceId);
+    if (priorInstance && priorInstance !== name) {
+      const owned = (await instanceAccess(priorInstance, secret)) === "owned";
+      const result = await reclaimStaleInstance(priorInstance, { force: owned });
+      if (!result.ok) return reclaimError(res, result);
+      if (deviceToInstance.get(deviceId) === priorInstance) deviceToInstance.delete(deviceId);
+      scheduleSave();
+    }
+
+    const existingOwner = instanceToDevice.get(name);
+    if (existingOwner && existingOwner !== deviceId) {
       const access = await instanceAccess(name, secret);
+      if (access === "error") return res.status(502).json({ error: "Could not verify the existing instance." });
       if (access === "owned") {
-        created = true;
-        reused = true;
-      } else if (access === "error") {
-        return res.status(502).json({ error: "Could not verify the existing instance." });
+        detachInstance(name, existingOwner);
       } else {
-        // Exists in Evolution under a different secret (mapping file lost, reinstall, ...).
-        // FIX C1 (c): reclaim only if it is not connected, then retry the create once.
         const result = await reclaimStaleInstance(name);
         if (!result.ok) return reclaimError(res, result);
-
-        const retry = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/create`, {
-          method: "POST", headers: evolutionHeaders(EVOLUTION_GLOBAL_KEY, true), body: JSON.stringify(requestBody)
-        });
-        body = await retry.json().catch(() => ({}));
-        if (!retry.ok) {
-          console.warn(`[CREATE] Evolution retry after reclaim returned HTTP ${retry.status}`);
-          return res.status(502).json({ error: "Evolution API rejected instance creation", details: body?.message || body?.error || null });
-        }
-        created = true;
       }
     }
 
-    if (!created) {
-      console.warn(`[CREATE] Evolution rejected ${name}: HTTP ${response.status}`);
-      return res.status(502).json({ error: "Evolution API rejected instance creation", details: body?.message || body?.error || null });
-    }
+    const requestBody = {
+      instanceName: name, token: secret, qrcode: true, integration: "WHATSAPP-BAILEYS",
+      groupsIgnore: true, alwaysOnline: false, readMessages: false, readStatus: false,
+      rejectCall: false, webhook: webhookConfig()
+    };
+    if (wantsPairing) requestBody.number = phone;
 
-    // Re-check after the awaits (race condition protection); roll back a freshly created instance on conflict.
     try {
-      if (fcmToken) deviceTokens.set(deviceId, fcmToken);
-      attachMapping(name, deviceId);
-    } catch (err) {
-      console.warn(`[CREATE] Mapping conflict for ${name}: ${err.message}`);
-      if (!reused) {
-        try {
-          const del = await deleteEvolutionInstance(name);
-          await discard(del);
-        } catch (cleanupErr) {
-          console.error(`[CREATE] Cleanup of ${name} failed: ${cleanupErr.message}`);
+      const response = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/create`, {
+        method: "POST", headers: evolutionHeaders(EVOLUTION_GLOBAL_KEY, true), body: JSON.stringify(requestBody)
+      });
+      let body = await response.json().catch(() => ({}));
+      let created = response.ok;
+      let reused = false;
+
+      if (!created && [400, 403, 409].includes(response.status) && /already|exists|in use/i.test(JSON.stringify(body))) {
+        const access = await instanceAccess(name, secret);
+        if (access === "owned") {
+          created = true;
+          reused = true;
+        } else if (access === "error") {
+          return res.status(502).json({ error: "Could not verify the existing instance." });
+        } else {
+          const result = await reclaimStaleInstance(name);
+          if (!result.ok) return reclaimError(res, result);
+
+          const retry = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/create`, {
+            method: "POST", headers: evolutionHeaders(EVOLUTION_GLOBAL_KEY, true), body: JSON.stringify(requestBody)
+          });
+          body = await retry.json().catch(() => ({}));
+          if (!retry.ok) {
+            console.warn(`[CREATE] Evolution retry after reclaim returned HTTP ${retry.status}`);
+            return res.status(502).json({ error: "Evolution API rejected instance creation", details: body?.message || body?.error || null });
+          }
+          created = true;
         }
       }
-      return res.status(409).json({ error: "Instance mapping conflict." });
+
+      if (!created) {
+        console.warn(`[CREATE] Evolution rejected ${name}: HTTP ${response.status}`);
+        return res.status(502).json({ error: "Evolution API rejected instance creation", details: body?.message || body?.error || null });
+      }
+
+      try {
+        if (fcmToken) deviceTokens.set(deviceId, fcmToken);
+        attachMapping(name, deviceId);
+        // ENHANCEMENT E3: Strict persistence to guarantee rollback capability on disk failure
+        writeMappingsStrict(); 
+      } catch (err) {
+        console.error(`[CREATE] Persistence failed for ${name}, rolling back Evolution instance: ${err.message}`);
+        if (!reused) {
+          try {
+            const del = await deleteEvolutionInstance(name);
+            await discard(del);
+          } catch (cleanupErr) {
+            console.error(`[CREATE] Cleanup of ${name} failed: ${cleanupErr.message}`);
+          }
+        }
+        detachInstance(name, deviceId);
+        return res.status(500).json({ error: "Failed to persist instance mapping. Please try again." });
+      }
+
+      try { await configureWebhook(name); }
+      catch (err) { console.error(`[WEBHOOK] Configure failed for ${name}: ${err.message}`); }
+
+      let pairingCode = body?.qrcode?.pairingCode ?? body?.pairingCode ?? null;
+      if (wantsPairing && !pairingCode) pairingCode = await requestPairingCode(name, secret, phone);
+      const state = reused ? await getInstanceState(name, secret) : null;
+
+      return res.status(reused ? 200 : 201).json({
+        instanceName: name, deviceSecret: secret, pairingCode,
+        ...(reused ? { alreadyExisted: true, connectionState: state } : {})
+      });
+    } catch (err) {
+      console.error(`[CREATE] Failed for ${name}: ${err.message}`);
+      return res.status(502).json({ error: "Could not communicate with Evolution API" });
     }
-
-    try { await configureWebhook(name); }
-    catch (err) { console.error(`[WEBHOOK] Configure failed for ${name}: ${err.message}`); }
-
-    let pairingCode = body?.qrcode?.pairingCode ?? body?.pairingCode ?? null;
-    if (wantsPairing && !pairingCode) pairingCode = await requestPairingCode(name, secret, phone);
-    const state = reused ? await getInstanceState(name, secret) : null;
-
-    return res.status(reused ? 200 : 201).json({
-      instanceName: name, deviceSecret: secret, pairingCode,
-      ...(reused ? { alreadyExisted: true, connectionState: state } : {})
-    });
-  } catch (err) {
-    console.error(`[CREATE] Failed for ${name}: ${err.message}`);
-    return res.status(502).json({ error: "Could not communicate with Evolution API" });
+  } finally {
+    // Always release the lock, even if an error occurs or early return happens
+    provisioningLocks.delete(lockKey);
   }
 });
 
@@ -1081,7 +1125,6 @@ app.post("/api/device/fcm", verifyHmac, async (req, res) => {
     return res.status(400).json({ error: "Invalid FCM token" });
   }
 
-  // 1. ALWAYS persist the token first. Never lose it to a link-ordering race.
   deviceTokens.set(req.deviceId, token);
   scheduleSave();
 
@@ -1089,7 +1132,6 @@ app.post("/api/device/fcm", verifyHmac, async (req, res) => {
     || req.get("x-instance-name")
     || deviceToInstance.get(req.deviceId);
 
-  // 2. No instance yet → token is safe. /api/instance/create will bind it later.
   if (!claimed) {
     console.log(`[FCM] ✅ Token stored for device=${req.deviceId} (unlinked; will bind on create).`);
     return res.status(200).json({ success: true, linked: false, instanceName: null });
@@ -1099,11 +1141,9 @@ app.post("/api/device/fcm", verifyHmac, async (req, res) => {
     return res.status(400).json({ error: "Invalid instance name" });
   }
 
-  // 3. Verify ownership before attaching anything.
   const access = await instanceAccess(claimed, req.deviceToken);
 
   if (access === "missing") {
-    // Token is already stored. Tell the client to retry after creating the instance.
     console.log(`[FCM] ⏳ Token stored for device=${req.deviceId}; instance=${claimed} not created yet.`);
     return res.status(202).json({ success: true, linked: false, reason: "instance_not_created_yet" });
   }
@@ -1123,14 +1163,12 @@ app.post("/api/device/fcm", verifyHmac, async (req, res) => {
     return res.status(409).json({ error: "Device is already mapped to another instance" });
   }
 
-  // 4. attachMapping() copies deviceTokens → instanceTokens automatically.
   attachMapping(claimed, req.deviceId);
 
   console.log(`[FCM] ✅ Token stored AND linked: device=${req.deviceId} instance=${claimed}`);
   return res.status(200).json({ success: true, linked: true, instanceName: claimed });
 });
 
-// FIX B5: end-to-end proof. Sends a PING data message to the calling device.
 app.post("/api/device/fcm/test", verifyHmac, async (req, res) => {
   const name = deviceToInstance.get(req.deviceId);
   if (!name) return res.status(404).json({ error: "Device is not linked to an instance" });
@@ -1227,7 +1265,6 @@ app.post("/webhook/evolution", verifyWebhook, async (req, res) => {
         const dedupeId = messageId ? `upsert:${messageId}:${Boolean(key.fromMe)}` : null;
         if (dedupeId && webhookAlreadyDelivered(instanceName, dedupeId)) continue;
 
-        // FIX C2: unresolved @lid chats are delivered with an empty phoneNumber + remoteJid, not dropped.
         const chat = resolveChat(key);
         if (!chat.deliverable) {
           console.info(`[WEBHOOK] Skipped non-direct chat instance=${instanceName} jidDomain=${chat.remoteJid.split("@")[1] || "none"} fromMe=${Boolean(key.fromMe)}`);
@@ -1323,9 +1360,6 @@ app.post("/webhook/evolution", verifyWebhook, async (req, res) => {
   }
 });
 
-// ----------------------------------------------------------------------------
-// 10. Global Error Handler & Cleanup
-// ----------------------------------------------------------------------------
 app.use((err, _req, res, _next) => {
   if (err?.type === "entity.too.large") return res.status(413).json({ error: "Request body too large" });
   if (err instanceof SyntaxError && "body" in err) return res.status(400).json({ error: "Malformed JSON" });
@@ -1342,9 +1376,6 @@ const cleanupTimer = setInterval(() => {
 }, 60 * 60 * 1000);
 cleanupTimer.unref?.();
 
-// ----------------------------------------------------------------------------
-// 11. Initialization & Graceful Shutdown
-// ----------------------------------------------------------------------------
 async function initializeFirebase() {
   try {
     if (getApps().length === 0) {
@@ -1385,7 +1416,6 @@ async function shutdown(signal) {
     process.exit(0);
   });
 
-  // Force exit if graceful shutdown hangs
   setTimeout(() => {
     console.error("[SHUTDOWN] Force exit after timeout.");
     process.exit(1);
