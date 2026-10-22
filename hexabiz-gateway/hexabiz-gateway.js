@@ -11,13 +11,21 @@ import { getMessaging } from "firebase-admin/messaging";
 // HexaSynq Gateway — Production-Ready Security & Orchestration Layer
 // Node.js 20+ | ES Modules | Hexagon Bizolutions
 //
-// FCM fixes applied (search "FIX:"):
+// FCM fixes (search "FIX B"):
 //   B1 sendFcm splits mapping_missing / token_missing
 //   B2 create logs whether an FCM token arrived
 //   B3 failed creates no longer burn the 24 h per-IP limit
 //   B4 jidToPhone no longer treats @lid as a phone number
 //   B5 POST /api/device/fcm/test sends a PING push to the calling device
 //   B6 startup check that the persistence directory is writable
+//
+// Regression fixes (search "FIX C"):
+//   C1 re-enrolling after reinstall / number switch no longer dead-ends in 409.
+//      Instances that are not connected are reclaimed; connected ones are never
+//      deleted, and there is no "force" for foreign instances.
+//   C2 @lid chats are DELIVERED (phoneNumber "" + remoteJid) instead of being
+//      silently dropped. The Android app must fall back to remoteJid/pushName
+//      when phoneNumber is empty.
 // ============================================================================
 function positiveInt(value, fallback) {
   const n = Number.parseInt(value ?? "", 10);
@@ -414,10 +422,8 @@ async function verifyPlayIntegrity(req, res, next) {
 
     const result = await response.json();
     if (result?.valid !== true) {
-      await discard(response);
       return res.status(401).json({ error: "Play Integrity verification failed" });
     }
-    await discard(response);
     next();
   } catch (err) {
     console.error(`[INTEGRITY] Verification service failed: ${err.message}`);
@@ -527,6 +533,11 @@ async function getInstanceState(name, secret) {
   }
 }
 
+// FIX C1: state lookup with the global key, so we can inspect instances owned by another secret.
+async function getInstanceStateGlobal(name) {
+  return getInstanceState(name, EVOLUTION_GLOBAL_KEY);
+}
+
 async function configureWebhook(name) {
   const r = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/webhook/set/${encodeURIComponent(name)}`, {
     method: "POST",
@@ -553,6 +564,45 @@ async function deleteEvolutionInstance(name) {
     method: "DELETE", headers: evolutionHeaders(EVOLUTION_GLOBAL_KEY)
   });
   return response;
+}
+
+// FIX C1: delete an Evolution instance that is NOT connected and clear its local mappings.
+// A connected ("open") instance is never touched unless the caller proved ownership (force).
+async function reclaimStaleInstance(name, { force = false } = {}) {
+  const exists = await instanceExists(name);
+  if (exists === null) return { ok: false, reason: "evolution_unreachable" };
+
+  if (exists) {
+    if (!force) {
+      const state = await getInstanceStateGlobal(name);
+      if (state === null) return { ok: false, reason: "state_unknown" };
+      if (state === "open") return { ok: false, reason: "connected" };
+      console.log(`[RECLAIM] ${name} is not connected (state=${state}); deleting stale instance.`);
+    } else {
+      console.log(`[RECLAIM] ${name} released by its owner; deleting.`);
+    }
+    try {
+      const r = await deleteEvolutionInstance(name);
+      const okDelete = r.ok || r.status === 404;
+      await discard(r);
+      if (!okDelete) return { ok: false, reason: "delete_failed" };
+    } catch (err) {
+      console.warn(`[RECLAIM] Delete failed for ${name}: ${err.message}`);
+      return { ok: false, reason: "delete_failed" };
+    }
+  }
+
+  const owner = instanceToDevice.get(name);
+  if (owner) detachInstance(name, owner);
+  instanceTokens.delete(name);
+  return { ok: true };
+}
+
+function reclaimError(res, result) {
+  if (result.reason === "connected") {
+    return res.status(409).json({ error: "This WhatsApp number is currently connected on another device." });
+  }
+  return res.status(502).json({ error: "Could not reset the existing instance. Try again." });
 }
 
 async function requestPairingCode(name, secret, phone) {
@@ -726,6 +776,18 @@ function jidToPhone(jid) {
   return match?.[1] ?? null;
 }
 
+function isLidJid(jid) {
+  return typeof jid === "string" && /@(?:hosted\.)?lid$/i.test(jid);
+}
+
+// FIX C2: resolve a chat to { phone, remoteJid, deliverable }.
+// An unresolved @lid chat is still deliverable: phone is "" and the app uses remoteJid/pushName.
+function resolveChat(key) {
+  const phone = jidToPhone(key?.remoteJidAlt) || jidToPhone(key?.senderPn) || jidToPhone(key?.remoteJid) || "";
+  const remoteJid = typeof key?.remoteJid === "string" ? key.remoteJid : "";
+  return { phone, remoteJid, deliverable: Boolean(phone) || isLidJid(remoteJid) };
+}
+
 function extractMessageText(message) {
   if (!message || typeof message !== "object") return "";
   let current = message;
@@ -835,6 +897,10 @@ function rememberWebhookDelivered(instanceName, id) {
   webhookSeen.set(`${instanceName}:${id}`, Date.now() + 10 * 60 * 1000);
   evictOldest(webhookSeen, MAX_WEBHOOK_SEEN);
 }
+
+// ----------------------------------------------------------------------------
+// 9. Routes
+// ----------------------------------------------------------------------------
 app.get("/", (_req, res) => {
   res.type("html").send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HexaSynq Gateway</title><style>body{font-family:system-ui;background:#0a0a0f;color:#eee;display:grid;place-items:center;min-height:100vh;margin:0}.card{max-width:640px;padding:2rem;border:1px solid #26303a;border-radius:16px;background:#13131f}h1{color:#00ddeb}small{color:#aab}</style></head><body><main class="card"><h1>HexaSynq Gateway</h1><p>Secure AI and WhatsApp orchestration layer by Hexagon Bizolutions.</p><p><small>Use authenticated API endpoints; operational details are available through /health.</small></p></main></body></html>`);
 });
@@ -904,16 +970,28 @@ app.post("/api/instance/create", verifyEnrollment, async (req, res) => {
   // FIX B2: make it obvious in the logs whether the app sent a token at enrollment.
   console.log(`[CREATE] ${name} device=${deviceId} hasFcmToken=${Boolean(fcmToken)} pairing=${wantsPairing}`);
 
-  // Local mapping conflicts are checked BEFORE touching Evolution
+  // FIX C1 (a): this device is switching numbers. Its own secret owns the old instance, so it may release it.
+  const priorInstance = deviceToInstance.get(deviceId);
+  if (priorInstance && priorInstance !== name) {
+    const owned = (await instanceAccess(priorInstance, secret)) === "owned";
+    const result = await reclaimStaleInstance(priorInstance, { force: owned });
+    if (!result.ok) return reclaimError(res, result);
+    if (deviceToInstance.get(deviceId) === priorInstance) deviceToInstance.delete(deviceId);
+    scheduleSave();
+  }
+
+  // FIX C1 (b): the number is mapped to another device (e.g. the app was reinstalled and got a new deviceId).
   const existingOwner = instanceToDevice.get(name);
   if (existingOwner && existingOwner !== deviceId) {
     const access = await instanceAccess(name, secret);
-    if (access !== "owned") return res.status(409).json({ error: "This number is linked to a different device." });
-  }
-
-  const priorInstance = deviceToInstance.get(deviceId);
-  if (priorInstance && priorInstance !== name) {
-    return res.status(409).json({ error: "This device is already linked to a different instance. Release it first." });
+    if (access === "error") return res.status(502).json({ error: "Could not verify the existing instance." });
+    if (access === "owned") {
+      // Same secret owns it in Evolution: just move the local mapping.
+      detachInstance(name, existingOwner);
+    } else {
+      const result = await reclaimStaleInstance(name);
+      if (!result.ok) return reclaimError(res, result);
+    }
   }
 
   const requestBody = {
@@ -927,15 +1005,33 @@ app.post("/api/instance/create", verifyEnrollment, async (req, res) => {
     const response = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/create`, {
       method: "POST", headers: evolutionHeaders(EVOLUTION_GLOBAL_KEY, true), body: JSON.stringify(requestBody)
     });
-    const body = await response.json().catch(() => ({}));
+    let body = await response.json().catch(() => ({}));
     let created = response.ok;
     let reused = false;
 
     if (!created && [400, 403, 409].includes(response.status) && /already|exists|in use/i.test(JSON.stringify(body))) {
       const access = await instanceAccess(name, secret);
-      if (access === "owned") { created = true; reused = true; }
-      else if (access === "foreign") return res.status(409).json({ error: "This number is linked to a different device." });
-      else return res.status(502).json({ error: "Could not verify the existing instance." });
+      if (access === "owned") {
+        created = true;
+        reused = true;
+      } else if (access === "error") {
+        return res.status(502).json({ error: "Could not verify the existing instance." });
+      } else {
+        // Exists in Evolution under a different secret (mapping file lost, reinstall, ...).
+        // FIX C1 (c): reclaim only if it is not connected, then retry the create once.
+        const result = await reclaimStaleInstance(name);
+        if (!result.ok) return reclaimError(res, result);
+
+        const retry = await fetchWithTimeout(`${EVOLUTION_SERVER_URL}/instance/create`, {
+          method: "POST", headers: evolutionHeaders(EVOLUTION_GLOBAL_KEY, true), body: JSON.stringify(requestBody)
+        });
+        body = await retry.json().catch(() => ({}));
+        if (!retry.ok) {
+          console.warn(`[CREATE] Evolution retry after reclaim returned HTTP ${retry.status}`);
+          return res.status(502).json({ error: "Evolution API rejected instance creation", details: body?.message || body?.error || null });
+        }
+        created = true;
+      }
     }
 
     if (!created) {
@@ -943,7 +1039,7 @@ app.post("/api/instance/create", verifyEnrollment, async (req, res) => {
       return res.status(502).json({ error: "Evolution API rejected instance creation", details: body?.message || body?.error || null });
     }
 
-    // Re-check after the await (race condition protection); roll back a freshly created instance on conflict.
+    // Re-check after the awaits (race condition protection); roll back a freshly created instance on conflict.
     try {
       if (fcmToken) deviceTokens.set(deviceId, fcmToken);
       attachMapping(name, deviceId);
@@ -1131,11 +1227,14 @@ app.post("/webhook/evolution", verifyWebhook, async (req, res) => {
         const dedupeId = messageId ? `upsert:${messageId}:${Boolean(key.fromMe)}` : null;
         if (dedupeId && webhookAlreadyDelivered(instanceName, dedupeId)) continue;
 
-        // Prefer the phone-number JID. With FIX B4, an unresolved @lid is skipped, not turned into a fake number.
-        const phone = jidToPhone(key.remoteJidAlt) || jidToPhone(key.senderPn) || jidToPhone(key.remoteJid);
-        if (!phone) {
-          console.info(`[WEBHOOK] Skipped unresolved JID instance=${instanceName} remoteJid=${String(key.remoteJid || "").split("@")[1] || "none"} fromMe=${Boolean(key.fromMe)}`);
+        // FIX C2: unresolved @lid chats are delivered with an empty phoneNumber + remoteJid, not dropped.
+        const chat = resolveChat(key);
+        if (!chat.deliverable) {
+          console.info(`[WEBHOOK] Skipped non-direct chat instance=${instanceName} jidDomain=${chat.remoteJid.split("@")[1] || "none"} fromMe=${Boolean(key.fromMe)}`);
           continue;
+        }
+        if (!chat.phone) {
+          console.info(`[WEBHOOK] LID chat delivered without phone number instance=${instanceName} messageId=${messageId || "none"}`);
         }
 
         const protocol = item?.message?.protocolMessage;
@@ -1143,7 +1242,8 @@ app.post("/webhook/evolution", verifyWebhook, async (req, res) => {
           const deletedId = protocol.key?.id;
           if (deletedId) {
             const result = await sendFcm(instanceName, {
-              type: "MESSAGE_DELETED", messageId: deletedId, phoneNumber: phone, originalText: ""
+              type: "MESSAGE_DELETED", messageId: deletedId, phoneNumber: chat.phone,
+              remoteJid: chat.remoteJid, originalText: ""
             });
             if (result.sent && dedupeId) rememberWebhookDelivered(instanceName, dedupeId);
           }
@@ -1162,7 +1262,8 @@ app.post("/webhook/evolution", verifyWebhook, async (req, res) => {
 
         const result = await sendFcm(instanceName, {
           type: key.fromMe ? "SENT_WHATSAPP_MESSAGE" : "NEW_WHATSAPP_MESSAGE",
-          phoneNumber: phone,
+          phoneNumber: chat.phone,
+          remoteJid: chat.remoteJid,
           pushName: truncateUtf8(item?.pushName || "Unknown", 80),
           messageText: text ? truncateUtf8(text, FCM_TEXT_BYTES) : "[Media Message]",
           messageId,
@@ -1177,20 +1278,21 @@ app.post("/webhook/evolution", verifyWebhook, async (req, res) => {
         const key = item?.key;
         const status = item?.update?.status;
         if (!key?.id || status == null) continue;
-        const phone = jidToPhone(key.remoteJidAlt) || jidToPhone(key.remoteJid);
-        if (!phone) continue;
+        const chat = resolveChat(key);
+        if (!chat.deliverable) continue;
         await sendFcm(instanceName, {
-          type: "MESSAGE_STATUS_UPDATE", messageId: key.id, phoneNumber: phone,
-          status: String(status), isFromMe: String(Boolean(key.fromMe))
+          type: "MESSAGE_STATUS_UPDATE", messageId: key.id, phoneNumber: chat.phone,
+          remoteJid: chat.remoteJid, status: String(status), isFromMe: String(Boolean(key.fromMe))
         });
       }
     } else if (event === "messages.delete" || event === "message.revoke") {
       for (const item of items) {
         const messageId = item?.key?.id || item?.id;
         if (!messageId) continue;
+        const chat = resolveChat(item?.key);
         await sendFcm(instanceName, {
           type: "MESSAGE_DELETED", messageId,
-          phoneNumber: jidToPhone(item?.key?.remoteJidAlt) || jidToPhone(item?.key?.remoteJid) || "",
+          phoneNumber: chat.phone, remoteJid: chat.remoteJid,
           originalText: truncateUtf8(item?.message?.conversation || "", FCM_TEXT_BYTES)
         });
       }
@@ -1199,9 +1301,9 @@ app.post("/webhook/evolution", verifyWebhook, async (req, res) => {
         const jid = item?.id;
         const presence = item?.presence || item?.presences?.[jid]?.lastKnownPresence;
         const phone = jidToPhone(jid);
-        if (!phone || !presence) continue;
+        if ((!phone && !isLidJid(jid)) || !presence) continue;
         await sendFcm(instanceName, {
-          type: "PRESENCE_UPDATE", phoneNumber: phone,
+          type: "PRESENCE_UPDATE", phoneNumber: phone || "", remoteJid: String(jid),
           isOnline: String(["available", "composing", "recording"].includes(presence))
         });
       }
