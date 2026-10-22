@@ -1376,21 +1376,49 @@ const cleanupTimer = setInterval(() => {
 }, 60 * 60 * 1000);
 cleanupTimer.unref?.();
 
+
 async function initializeFirebase() {
   try {
     if (getApps().length === 0) {
-      initializeApp({ credential: cert(FIREBASE_SERVICE_ACCOUNT_PATH) });
+      const serviceAccountRaw = fs.readFileSync(
+        FIREBASE_SERVICE_ACCOUNT_PATH,
+        "utf8"
+      );
+
+      const serviceAccount = JSON.parse(serviceAccountRaw);
+
+      if (
+        serviceAccount.type !== "service_account" ||
+        !serviceAccount.project_id ||
+        !serviceAccount.client_email ||
+        !serviceAccount.private_key
+      ) {
+        throw new Error(
+          "Firebase service-account JSON is missing required fields."
+        );
+      }
+
+      initializeApp({
+        credential: cert(serviceAccount),
+      });
     }
+
     getMessaging();
+
     firebaseReady = true;
     firebaseError = null;
+
     console.log("[FCM] Firebase Admin initialized.");
   } catch (err) {
     firebaseReady = false;
-    firebaseError = err.message;
-    console.error(`[FCM] Initialization failed (FCM pushes will be disabled): ${err.message}`);
+    firebaseError = err?.message || "Firebase initialization failed";
+
+    console.error(
+      `[FCM] Firebase Admin initialization failed: ${firebaseError}`
+    );
   }
 }
+
 
 await initializeFirebase();
 
