@@ -20,7 +20,14 @@ const POLLINATIONS_BASE_URL = (process.env.POLLINATIONS_BASE_URL || "https://gen
 const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "";
 const POLLINATIONS_MODEL = process.env.POLLINATIONS_MODEL || "openai/gpt-5.4-nano";
 const ENROLLMENT_KEY = process.env.ENROLLMENT_KEY || "";
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
+const WEBHOOK_SECRET =
+  process.env.WEBHOOK_SECRET ||
+  (EVOLUTION_GLOBAL_KEY
+    ? crypto
+        .createHmac("sha256", EVOLUTION_GLOBAL_KEY)
+        .update("webhook:evolution")
+        .digest("hex")
+    : "");
 const EVOLUTION_WEBSOCKET_EVENTS = [
   "MESSAGES_SET", "MESSAGES_UPSERT", "MESSAGES_UPDATE", "MESSAGES_DELETE",
   "SEND_MESSAGE", "CONTACTS_SET", "CONTACTS_UPSERT", "CONTACTS_UPDATE",
