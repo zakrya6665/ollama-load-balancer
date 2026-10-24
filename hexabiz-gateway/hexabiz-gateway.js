@@ -34,7 +34,7 @@ for (const file of [".env", path.join(process.cwd(), ".env")]) {
 console.log("DEBUG - ENROLLMENT_KEY present:", !!process.env.ENROLLMENT_KEY);
 console.log("DEBUG - ENROLLMENT_KEY Length:", process.env.ENROLLMENT_KEY ? process.env.ENROLLMENT_KEY.length : 0);
 console.log("DEBUG - APP_ENROLLMENT_KEY present:", !!process.env.APP_ENROLLMENT_KEY);
-console.log("DEBUG - Active ENROLLMENT_KEY Value:", JSON.stringify(ENROLLMENT_KEY));
+
 
 // HexaSynq Gateway — Node.js 20+, ESM
 // Required dependencies: express, helmet, node-fetch, firebase-admin
@@ -49,6 +49,7 @@ const POLLINATIONS_BASE_URL = (process.env.POLLINATIONS_BASE_URL || "https://gen
 const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "";
 const POLLINATIONS_MODEL = process.env.POLLINATIONS_MODEL || "openai/gpt-5.4-nano";
 const ENROLLMENT_KEY = process.env.ENROLLMENT_KEY || "";
+console.log("DEBUG - Active ENROLLMENT_KEY Value:", JSON.stringify(ENROLLMENT_KEY));
 const WEBHOOK_SECRET =
   process.env.WEBHOOK_SECRET ||
   (EVOLUTION_GLOBAL_KEY
