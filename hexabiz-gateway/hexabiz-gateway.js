@@ -7,6 +7,34 @@ import path from "node:path";
 import { initializeApp, cert, getApps } from "firebase-admin/app";
 import { getMessaging } from "firebase-admin/messaging";
 
+// Auto-load local .env file if present so environment variables are populated
+for (const file of [".env", path.join(process.cwd(), ".env")]) {
+  try {
+    if (fsSync.existsSync(file)) {
+      const content = fsSync.readFileSync(file, "utf8");
+      for (const line of content.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const idx = trimmed.indexOf("=");
+        if (idx > 0) {
+          const key = trimmed.slice(0, idx).trim();
+          let val = trimmed.slice(idx + 1).trim();
+        
+          if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+            val = val.slice(1, -1);
+          }
+          if (!process.env[key]) process.env[key] = val;
+        }
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+// === SAFE DEBUG LOGS (OUTSIDE THE LOOP) ===
+console.log("DEBUG - ENROLLMENT_KEY present:", !!process.env.ENROLLMENT_KEY);
+console.log("DEBUG - ENROLLMENT_KEY Length:", process.env.ENROLLMENT_KEY ? process.env.ENROLLMENT_KEY.length : 0);
+console.log("DEBUG - APP_ENROLLMENT_KEY present:", !!process.env.APP_ENROLLMENT_KEY);
+
 // HexaSynq Gateway — Node.js 20+, ESM
 // Required dependencies: express, helmet, node-fetch, firebase-admin
 
