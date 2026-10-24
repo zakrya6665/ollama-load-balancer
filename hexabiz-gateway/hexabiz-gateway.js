@@ -3,6 +3,7 @@ import helmet from "helmet";
 import fetch from "node-fetch";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import { initializeApp, cert, getApps } from "firebase-admin/app";
 import { getMessaging } from "firebase-admin/messaging";
@@ -19,7 +20,6 @@ for (const file of [".env", path.join(process.cwd(), ".env")]) {
         if (idx > 0) {
           const key = trimmed.slice(0, idx).trim();
           let val = trimmed.slice(idx + 1).trim();
-        
           if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
             val = val.slice(1, -1);
           }
@@ -29,12 +29,6 @@ for (const file of [".env", path.join(process.cwd(), ".env")]) {
     }
   } catch { /* ignore */ }
 }
-
-// === SAFE DEBUG LOGS (OUTSIDE THE LOOP) ===
-console.log("DEBUG - ENROLLMENT_KEY present:", !!process.env.ENROLLMENT_KEY);
-console.log("DEBUG - ENROLLMENT_KEY Length:", process.env.ENROLLMENT_KEY ? process.env.ENROLLMENT_KEY.length : 0);
-console.log("DEBUG - APP_ENROLLMENT_KEY present:", !!process.env.APP_ENROLLMENT_KEY);
-
 
 // HexaSynq Gateway — Node.js 20+, ESM
 // Required dependencies: express, helmet, node-fetch, firebase-admin
@@ -48,8 +42,7 @@ const OLLAMA_DEFAULT_MODEL = process.env.OLLAMA_DEFAULT_MODEL || "synq:latest";
 const POLLINATIONS_BASE_URL = (process.env.POLLINATIONS_BASE_URL || "https://gen.pollinations.ai").replace(/\/+$/, "");
 const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "";
 const POLLINATIONS_MODEL = process.env.POLLINATIONS_MODEL || "openai/gpt-5.4-nano";
-const ENROLLMENT_KEY = process.env.ENROLLMENT_KEY || "";
-console.log("DEBUG - Active ENROLLMENT_KEY Value:", JSON.stringify(ENROLLMENT_KEY));
+const ENROLLMENT_KEY = process.env.ENROLLMENT_KEY || process.env.APP_ENROLLMENT_KEY || "";
 const WEBHOOK_SECRET =
   process.env.WEBHOOK_SECRET ||
   (EVOLUTION_GLOBAL_KEY
@@ -514,7 +507,16 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
           websocketConfigured = false;
           process.stderr.write(`[WEBSOCKET] Configure failed for existing instance ${instanceName}: ${error?.status || error?.code || "unknown"}\n`);
         }
-        return { instanceName, deviceSecret: deriveDeviceSecret(deviceId), created: false, existing: true, websocketConfigured };
+        let pairingCode = null;
+        if (usePairingCode) {
+          try {
+            const connect = await evolutionRequest(`/instance/connect/${encodeURIComponent(instanceName)}?number=${encodeURIComponent(phoneNumber)}`);
+            pairingCode = connect?.pairingCode || connect?.pairing_code || connect?.code || null;
+          } catch (connectError) {
+            process.stderr.write(`[PAIRING] Existing instance pairing code connect error: ${connectError?.message}\n`);
+          }
+        }
+        return { instanceName, deviceSecret: deriveDeviceSecret(deviceId), created: false, existing: true, pairingCode, websocketConfigured };
       }
 
       const otherDeviceId = store.instances[instanceName];
@@ -552,7 +554,15 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
         });
         createdByThisRequest = true;
         createdInstance = true;
-        const pairingCode = created?.pairingCode || created?.pairing_code || created?.instance?.pairingCode || null;
+        let pairingCode = created?.pairingCode || created?.pairing_code || created?.instance?.pairingCode || null;
+        if (usePairingCode && !pairingCode) {
+          try {
+            const connect = await evolutionRequest(`/instance/connect/${encodeURIComponent(instanceName)}?number=${encodeURIComponent(phoneNumber)}`);
+            pairingCode = connect?.pairingCode || connect?.pairing_code || connect?.code || null;
+          } catch (connectError) {
+            process.stderr.write(`[PAIRING] New instance pairing code connect error: ${connectError?.message}\n`);
+          }
+        }
         let websocketConfigured = true;
         try { await configureEvolutionWebsocket(instanceName); }
         catch (error) {
@@ -758,10 +768,13 @@ app.post("/webhook/evolution", (req, res) => {
     instanceName,
     messageId,
     chatId: String(key.remoteJid || data.remoteJid || data.chatId || ""),
+    phoneNumber: String(key.remoteJid || data.remoteJid || data.chatId || "").substring(0, 30).replace(/[^0-9]/g, ""),
     fromMe: String(key.fromMe ?? data.fromMe ?? false),
     timestamp: String(data.messageTimestamp || data.timestamp || body.date_time || body.timestamp || ""),
     messageText: extractMessageText(message),
     messageType: String(message && typeof message === "object" ? Object.keys(message).find((name) => name.endsWith("Message")) || "text" : "text"),
+    hasMedia: String(Boolean(message && typeof message === "object" && Object.keys(message).some((name) => name.endsWith("Message") && name !== "extendedTextMessage"))),
+    status: String(data.update?.status || data.status || ""),
     notificationTitle: String(data.pushName || data.notifyName || data.name || "WhatsApp message").slice(0, 100),
   };
 
