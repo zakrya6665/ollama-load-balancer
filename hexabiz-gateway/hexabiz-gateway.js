@@ -34,6 +34,7 @@ for (const file of [".env", path.join(process.cwd(), ".env")]) {
 console.log("DEBUG - ENROLLMENT_KEY present:", !!process.env.ENROLLMENT_KEY);
 console.log("DEBUG - ENROLLMENT_KEY Length:", process.env.ENROLLMENT_KEY ? process.env.ENROLLMENT_KEY.length : 0);
 console.log("DEBUG - APP_ENROLLMENT_KEY present:", !!process.env.APP_ENROLLMENT_KEY);
+console.log("DEBUG - Active ENROLLMENT_KEY Value:", JSON.stringify(ENROLLMENT_KEY));
 
 // HexaSynq Gateway — Node.js 20+, ESM
 // Required dependencies: express, helmet, node-fetch, firebase-admin
