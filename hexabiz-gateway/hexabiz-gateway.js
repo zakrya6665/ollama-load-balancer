@@ -95,7 +95,10 @@ function normalizeDeviceId(value) {
   const id = String(value || "").trim();
   return /^[A-Za-z0-9_-]{8,128}$/.test(id) ? id : null;
 }
-function instanceNameForPhone(phone) {
+function instanceNameForPhone(phone, deviceId) {
+  if (deviceId) {
+    return `${deviceId}_${phone}`;
+  }
   return `dev_${phone}`;
 }
 function deriveDeviceSecret(deviceId) {
@@ -482,25 +485,34 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
 
   try {
     const result = await withProvisionLock(deviceId, async () => {
-      const existing = getDeviceRecord(deviceId);
-      const instanceName = instanceNameForPhone(phoneNumber);
+      const instanceName = instanceNameForPhone(phoneNumber, deviceId);
+      let existing = getDeviceRecord(deviceId);
+
+      // If no device record by deviceId directly, check if this instance was registered before
+      if (!existing && store.instances[instanceName]) {
+        existing = getDeviceRecord(store.instances[instanceName]);
+      }
+
       if (existing) {
-        if (existing.phoneNumber !== phoneNumber || existing.instanceName !== instanceName) {
+        const [instPrefix] = (existing.instanceName || "").split("_");
+        if (existing.phoneNumber !== phoneNumber && instPrefix !== deviceId) {
           const error = new Error("This device is already linked to a different WhatsApp number");
           error.status = 409;
           throw error;
         }
+
+        existing.deviceId = deviceId;
+        existing.phoneNumber = phoneNumber;
+        existing.instanceName = instanceName;
+        store.devices[deviceId] = existing;
+        store.instances[instanceName] = deviceId;
+
         if (fcmToken && existing.fcmToken !== fcmToken) {
-          const previousToken = existing.fcmToken;
-          const previousUpdatedAt = existing.updatedAt;
           existing.fcmToken = fcmToken;
           existing.updatedAt = new Date().toISOString();
-          try { await persistStore(); } catch (error) {
-            existing.fcmToken = previousToken;
-            existing.updatedAt = previousUpdatedAt;
-            throw error;
-          }
         }
+        await persistStore();
+
         let websocketConfigured = true;
         try { await configureEvolutionWebsocket(instanceName); }
         catch (error) {
@@ -521,14 +533,21 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
 
       const otherDeviceId = store.instances[instanceName];
       if (otherDeviceId && otherDeviceId !== deviceId) {
-        const error = new Error("This WhatsApp number is already linked to another device");
-        error.status = 409;
-        throw error;
+        const [instPrefix] = instanceName.split("_");
+        if (instPrefix === deviceId) {
+          // Same hardware checksum! Auto-link to this device
+          store.instances[instanceName] = deviceId;
+        } else {
+          const error = new Error("This WhatsApp number is already linked to another device");
+          error.status = 409;
+          throw error;
+        }
       }
 
       // Do not delete on a failed create unless this request can prove it created the instance.
       let createdByThisRequest = false;
       let createdInstance = false;
+      let pairingCode = null;
       try {
         const created = await evolutionRequest("/instance/create", {
           method: "POST",
@@ -554,48 +573,55 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
         });
         createdByThisRequest = true;
         createdInstance = true;
-        let pairingCode = created?.pairingCode || created?.pairing_code || created?.instance?.pairingCode || null;
-        if (usePairingCode && !pairingCode) {
-          try {
-            const connect = await evolutionRequest(`/instance/connect/${encodeURIComponent(instanceName)}?number=${encodeURIComponent(phoneNumber)}`);
-            pairingCode = connect?.pairingCode || connect?.pairing_code || connect?.code || null;
-          } catch (connectError) {
-            process.stderr.write(`[PAIRING] New instance pairing code connect error: ${connectError?.message}\n`);
-          }
+        pairingCode = created?.pairingCode || created?.pairing_code || created?.instance?.pairingCode || null;
+      } catch (createError) {
+        const isAlreadyExists = createError.status === 403 ||
+                                createError.status === 409 ||
+                                /already/i.test(createError?.data?.response?.message || createError?.message || "");
+        const [checksumPrefix] = instanceName.split("_");
+        if (isAlreadyExists && checksumPrefix === deviceId) {
+          process.stdout.write(`[INSTANCE] Auto-linking existing Evolution instance: ${instanceName}\n`);
+          // Instance already exists in Evolution API for this checksum; link to it
+        } else {
+          throw createError;
         }
-        let websocketConfigured = true;
-        try { await configureEvolutionWebsocket(instanceName); }
-        catch (error) {
-          websocketConfigured = false;
-          process.stderr.write(`[WEBSOCKET] Configure failed for new instance ${instanceName}: ${error?.status || error?.code || "unknown"}\n`);
-        }
-        const record = {
-          deviceId,
-          phoneNumber,
-          instanceName,
-          fcmToken: fcmToken || undefined,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-        store.devices[deviceId] = record;
-        store.instances[instanceName] = deviceId;
-        try {
-          await persistStore();
-        } catch (persistError) {
-          delete store.devices[deviceId];
-          delete store.instances[instanceName];
-          // Safe only because this invocation received a successful create response and
-          // no mapping existed for the instance before the request.
-          if (createdByThisRequest && createdInstance && !otherDeviceId) {
-            try { await deleteEvolutionInstance(instanceName); } catch { /* leave cleanup for operator if Evolution is unavailable */ }
-          }
-          throw persistError;
-        }
-        return { instanceName, deviceSecret: deriveDeviceSecret(deviceId), created: true, existing: false, pairingCode, websocketConfigured };
-      } catch (error) {
-        // Never attempt destructive rollback for errors where ownership is uncertain.
-        throw error;
       }
+
+      if (usePairingCode && !pairingCode) {
+        try {
+          const connect = await evolutionRequest(`/instance/connect/${encodeURIComponent(instanceName)}?number=${encodeURIComponent(phoneNumber)}`);
+          pairingCode = connect?.pairingCode || connect?.pairing_code || connect?.code || null;
+        } catch (connectError) {
+          process.stderr.write(`[PAIRING] Pairing code connect error: ${connectError?.message}\n`);
+        }
+      }
+      let websocketConfigured = true;
+      try { await configureEvolutionWebsocket(instanceName); }
+      catch (error) {
+        websocketConfigured = false;
+        process.stderr.write(`[WEBSOCKET] Configure failed for instance ${instanceName}: ${error?.status || error?.code || "unknown"}\n`);
+      }
+      const record = {
+        deviceId,
+        phoneNumber,
+        instanceName,
+        fcmToken: fcmToken || undefined,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      store.devices[deviceId] = record;
+      store.instances[instanceName] = deviceId;
+      try {
+        await persistStore();
+      } catch (persistError) {
+        delete store.devices[deviceId];
+        delete store.instances[instanceName];
+        if (createdByThisRequest && createdInstance && !otherDeviceId) {
+          try { await deleteEvolutionInstance(instanceName); } catch { /* leave cleanup for operator */ }
+        }
+        throw persistError;
+      }
+      return { instanceName, deviceSecret: deriveDeviceSecret(deviceId), created: createdInstance, existing: !createdInstance, pairingCode, websocketConfigured };
     });
     return res.status(result.created ? 201 : 200).json({ ok: true, ...result });
   } catch (error) {
@@ -736,8 +762,14 @@ app.post("/webhook/evolution", (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const instanceName = extractInstanceName(body);
   const eventName = webhookEventName(body);
-  if (!instanceName || !eventName) return jsonError(res, 400, "Webhook payload is missing instance or event");
-  const deviceId = store.instances[instanceName];
+  let deviceId = store.instances[instanceName];
+  if (!deviceId) {
+    const [instPrefix] = instanceName.split("_");
+    if (instPrefix && store.devices[instPrefix]) {
+      deviceId = instPrefix;
+      store.instances[instanceName] = deviceId;
+    }
+  }
   if (!deviceId) return res.status(200).json({ ok: true, ignored: true, reason: "unmapped_instance" });
 
   const data = body.data && typeof body.data === "object" ? body.data : {};
