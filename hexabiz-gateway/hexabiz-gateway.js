@@ -297,6 +297,14 @@ async function evolutionRequest(route, { method = "GET", body, timeoutMs = REQUE
 async function deleteEvolutionInstance(instanceName) {
   return evolutionRequest(`/instance/delete/${encodeURIComponent(instanceName)}`, { method: "DELETE" });
 }
+async function logoutEvolutionInstance(instanceName) {
+  try {
+    return await evolutionRequest(`/instance/logout/${encodeURIComponent(instanceName)}`, { method: "DELETE" });
+  } catch (error) {
+    process.stderr.write(`[LOGOUT] Evolution logout failed for ${instanceName}: ${error?.message}\n`);
+    return null;
+  }
+}
 async function configureEvolutionWebsocket(instanceName) {
   await evolutionRequest(`/websocket/set/${encodeURIComponent(instanceName)}`, {
     method: "POST",
@@ -670,19 +678,37 @@ app.post("/api/instance/release", verifyDeviceRequest, async (req, res) => {
   if (!record) return res.json({ ok: true, released: false, reason: "not_linked" });
   const requestedInstance = typeof req.body?.instanceName === "string" ? req.body.instanceName : record.instanceName;
   if (requestedInstance !== record.instanceName) return jsonError(res, 403, "Instance does not belong to this device");
-  // Release removes the gateway association only. It deliberately does not delete the
-  // Evolution instance; deletion is a separate, explicit administrative operation.
-  const oldRecord = { ...record };
-  delete store.instances[record.instanceName];
-  delete store.devices[req.deviceId];
-  try {
-    await persistStore();
-    return res.json({ ok: true, released: true, instanceName: requestedInstance });
-  } catch {
-    // Restore the mapping if the release did not reach durable storage.
-    store.devices[req.deviceId] = oldRecord;
-    store.instances[oldRecord.instanceName] = req.deviceId;
-    return jsonError(res, 500, "Could not persist instance release");
+
+  const isPermanent = req.body?.permanent === true || req.body?.mode === "permanent";
+
+  if (isPermanent) {
+    // Permanent unlink: delete instance in Evolution API and remove gateway mapping
+    try {
+      await deleteEvolutionInstance(record.instanceName);
+    } catch (e) {
+      process.stderr.write(`[DELETE] Evolution delete failed for ${record.instanceName}: ${e?.message}\n`);
+    }
+
+    const oldRecord = { ...record };
+    delete store.instances[record.instanceName];
+    delete store.devices[req.deviceId];
+    try {
+      await persistStore();
+      return res.json({ ok: true, released: true, mode: "permanent", instanceName: requestedInstance });
+    } catch {
+      store.devices[req.deviceId] = oldRecord;
+      store.instances[oldRecord.instanceName] = req.deviceId;
+      return jsonError(res, 500, "Could not persist instance release");
+    }
+  } else {
+    // Temporary unlink: logout WhatsApp session in Evolution API, disconnect socket
+    await logoutEvolutionInstance(record.instanceName);
+    delete record.fcmToken;
+    record.updatedAt = new Date().toISOString();
+    try {
+      await persistStore();
+    } catch { /* non-fatal */ }
+    return res.json({ ok: true, released: true, mode: "temporary", instanceName: requestedInstance });
   }
 });
 
@@ -795,19 +821,30 @@ app.post("/webhook/evolution", (req, res) => {
   webhookInFlight.add(dedupeKey);
 
   const message = data.message || data;
+  const rawJid = String(data.id || key.remoteJid || data.remoteJid || data.chatId || "");
+  const presencesObj = data.presences && typeof data.presences === "object" ? data.presences : {};
+  const firstPresence = Object.values(presencesObj)[0];
+  const presenceState = String(firstPresence?.lastKnownPresence || data.presence || data.status || data.state || "").toLowerCase();
+  const isOnline = presenceState === "available" || presenceState === "composing" || presenceState === "recording" || presenceState === "online";
+  const cleanPhone = rawJid.substring(0, 30).replace(/[^0-9]/g, "");
+
   const payload = {
     eventId: crypto.createHash("sha256").update(dedupeKey).digest("hex"),
     instanceName,
     messageId,
-    chatId: String(key.remoteJid || data.remoteJid || data.chatId || ""),
-    phoneNumber: String(key.remoteJid || data.remoteJid || data.chatId || "").substring(0, 30).replace(/[^0-9]/g, ""),
+    chatId: rawJid,
+    phoneNumber: cleanPhone,
     fromMe: String(key.fromMe ?? data.fromMe ?? false),
     timestamp: String(data.messageTimestamp || data.timestamp || body.date_time || body.timestamp || ""),
     messageText: extractMessageText(message),
     messageType: String(message && typeof message === "object" ? Object.keys(message).find((name) => name.endsWith("Message")) || "text" : "text"),
     hasMedia: String(Boolean(message && typeof message === "object" && Object.keys(message).some((name) => name.endsWith("Message") && name !== "extendedTextMessage"))),
     status: String(data.update?.status || data.status || ""),
-    notificationTitle: String(data.pushName || data.notifyName || data.name || "WhatsApp message").slice(0, 100),
+    isOnline: String(isOnline),
+    presenceState: presenceState,
+    notificationTitle: mapped[1] === "PRESENCE_UPDATE" && isOnline
+      ? String(data.pushName || data.name || "Contact is online").slice(0, 100)
+      : String(data.pushName || data.notifyName || data.name || "WhatsApp message").slice(0, 100),
   };
 
   // Return to Evolution immediately. FCM is best-effort and never blocks the
