@@ -20,15 +20,23 @@ for (const file of [".env", path.join(process.cwd(), ".env")]) {
         if (idx > 0) {
           const key = trimmed.slice(0, idx).trim();
           let val = trimmed.slice(idx + 1).trim();
+        
           if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
             val = val.slice(1, -1);
           }
           if (!process.env[key]) process.env[key] = val;
         }
+        
       }
     }
   } catch { /* ignore */ }
 }
+
+// === SAFE DEBUG LOGS (OUTSIDE THE LOOP) ===
+console.log("DEBUG - ENROLLMENT_KEY present:", !!process.env.ENROLLMENT_KEY);
+console.log("DEBUG - ENROLLMENT_KEY Length:", process.env.ENROLLMENT_KEY ? process.env.ENROLLMENT_KEY.length : 0);
+console.log("DEBUG - APP_ENROLLMENT_KEY present:", !!process.env.APP_ENROLLMENT_KEY);
+
 
 // HexaSynq Gateway — Node.js 20+, ESM
 // Required dependencies: express, helmet, node-fetch, firebase-admin
@@ -777,10 +785,10 @@ function extractMessageText(message) {
   return typeof text === "string" ? text.trim() : "";
 }
 function webhookMessageId(data, key) {
-  return String(key?.id || data?.id || data?.messageId || data?.message?.id || "");
+  return String(key?.id || data?.keyId || data?.id || data?.messageId || data?.message?.id || "");
 }
-function webhookDedupeKey(body, eventName, instanceName, messageId) {
-  if (messageId) return `${instanceName}:${eventName}:${messageId}`;
+function webhookDedupeKey(body, eventName, instanceName, messageId, status = "") {
+  if (messageId) return `${instanceName}:${eventName}:${messageId}${status ? `:${status}` : ""}`;
   return `${instanceName}:${eventName}:${crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex")}`;
 }
 app.post("/webhook/evolution", (req, res) => {
@@ -812,7 +820,8 @@ app.post("/webhook/evolution", (req, res) => {
   if (!mapped) return res.status(200).json({ ok: true, ignored: true, reason: "unsupported_event", event: eventName });
 
   const messageId = webhookMessageId(data, key);
-  const dedupeKey = webhookDedupeKey(body, eventName, instanceName, messageId);
+  const statusText = String(data.update?.status || data.status || "");
+  const dedupeKey = webhookDedupeKey(body, eventName, instanceName, messageId, statusText);
   cleanExpired(webhookDedupeCache, 10 * 60_000);
   if (webhookDedupeCache.has(dedupeKey) || webhookInFlight.has(dedupeKey)) {
     return res.status(200).json({ ok: true, duplicate: true });
