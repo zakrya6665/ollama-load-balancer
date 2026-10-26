@@ -32,10 +32,6 @@ for (const file of [".env", path.join(process.cwd(), ".env")]) {
   } catch { /* ignore */ }
 }
 
-// === SAFE DEBUG LOGS (OUTSIDE THE LOOP) ===
-console.log("DEBUG - ENROLLMENT_KEY present:", !!process.env.ENROLLMENT_KEY);
-console.log("DEBUG - ENROLLMENT_KEY Length:", process.env.ENROLLMENT_KEY ? process.env.ENROLLMENT_KEY.length : 0);
-console.log("DEBUG - APP_ENROLLMENT_KEY present:", !!process.env.APP_ENROLLMENT_KEY);
 
 
 // HexaSynq Gateway — Node.js 20+, ESM
@@ -47,18 +43,10 @@ const EVOLUTION_SERVER_URL = (process.env.EVOLUTION_SERVER_URL || "http://whatsa
 const EVOLUTION_GLOBAL_KEY = process.env.EVOLUTION_GLOBAL_KEY || process.env.EVOLUTION_API_KEY || "";
 const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://ollama:11434").replace(/\/+$/, "");
 const OLLAMA_DEFAULT_MODEL = process.env.OLLAMA_DEFAULT_MODEL || "synq:latest";
-const OLLAMA_TIMEOUT_MS = positiveInt(process.env.OLLAMA_TIMEOUT_MS, 4_000);
 const POLLINATIONS_BASE_URL = (process.env.POLLINATIONS_BASE_URL || "https://gen.pollinations.ai").replace(/\/+$/, "");
 const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "";
 const POLLINATIONS_MODEL = process.env.POLLINATIONS_MODEL || "openai/gpt-5.4-nano";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const ENROLLMENT_KEY = process.env.ENROLLMENT_KEY || process.env.APP_ENROLLMENT_KEY || "";
-
-function debugLog(category, ...args) {
-  const ts = new Date().toISOString();
-  const msg = args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ");
-  process.stdout.write(`[${ts}] [${category}] ${msg}\n`);
-}
 const WEBHOOK_SECRET =
   process.env.WEBHOOK_SECRET ||
   (EVOLUTION_GLOBAL_KEY
@@ -429,56 +417,39 @@ function pumpAiQueue() {
 }
 function chatMessagesFromBody(body) {
   if (Array.isArray(body?.messages)) {
-    return body.messages.filter((item) => item && ["system", "user", "assistant"].includes(item.role) && typeof item.content === "string")
-      .map((item) => ({ role: item.role, content: item.content.slice(0, MAX_PROMPT_CHARS) }));
+    if (body.messages.length === 0) return null;
+
+    const messages = [];
+
+    for (const item of body.messages) {
+      if (
+        !item ||
+        typeof item !== "object" ||
+        !["system", "user", "assistant"].includes(item.role) ||
+        typeof item.content !== "string" ||
+        !item.content.trim()
+      ) {
+        return null;
+      }
+
+      messages.push({
+        role: item.role,
+        content: item.content,
+      });
+    }
+
+    return messages;
   }
-  if (typeof body?.prompt === "string") return [{ role: "user", content: body.prompt.slice(0, MAX_PROMPT_CHARS) }];
+
+  if (typeof body?.prompt === "string" && body.prompt.trim()) {
+    return [{ role: "user", content: body.prompt }];
+  }
+
   return null;
 }
-async function checkInternetConnectivity() {
-  debugLog("INTERNET:CHECK", "Testing internet connectivity and upstream AI endpoints...");
-  try {
-    const c = new AbortController();
-    const t = setTimeout(() => c.abort(), 4000);
-    const res = await fetch("https://text.pollinations.ai/hello", { signal: c.signal });
-    clearTimeout(t);
-    const txt = await res.text();
-    debugLog("INTERNET:CHECK", `✓ text.pollinations.ai is reachable (status=${res.status}, preview="${txt.slice(0, 30).trim()}")`);
-  } catch (err) {
-    debugLog("INTERNET:CHECK", `✗ text.pollinations.ai unreachable: ${err.message}`);
-  }
-
-  try {
-    const c = new AbortController();
-    const t = setTimeout(() => c.abort(), 4000);
-    const res = await fetch(`${POLLINATIONS_BASE_URL}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: POLLINATIONS_MODEL, messages: [{ role: "user", content: "ping" }] }),
-      signal: c.signal,
-    });
-    clearTimeout(t);
-    debugLog("INTERNET:CHECK", `${res.ok ? "✓" : "!"} ${POLLINATIONS_BASE_URL} answered HTTP ${res.status}`);
-  } catch (err) {
-    debugLog("INTERNET:CHECK", `ℹ ${POLLINATIONS_BASE_URL} ping error: ${err.message}`);
-  }
-
-  try {
-    const c = new AbortController();
-    const t = setTimeout(() => c.abort(), 3000);
-    const res = await fetch(`${OLLAMA_BASE_URL}/api/tags`, { signal: c.signal });
-    clearTimeout(t);
-    debugLog("INTERNET:CHECK", `${res.ok ? "✓" : "!"} Ollama at ${OLLAMA_BASE_URL} reachable (status=${res.status})`);
-  } catch (err) {
-    debugLog("INTERNET:CHECK", `ℹ Ollama at ${OLLAMA_BASE_URL} not reachable: ${err.message} (will auto-fallback to Pollinations)`);
-  }
-}
-
 async function ollamaChat(messages) {
-  const start = Date.now();
-  debugLog("OLLAMA:DEBUG", `Calling Ollama at ${OLLAMA_BASE_URL}/api/chat (model=${OLLAMA_DEFAULT_MODEL}, messages=${messages.length})`);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
   try {
     const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
       method: "POST",
@@ -486,142 +457,30 @@ async function ollamaChat(messages) {
       body: JSON.stringify({ model: OLLAMA_DEFAULT_MODEL, messages, stream: false }),
       signal: controller.signal,
     });
-    const elapsed = Date.now() - start;
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      debugLog("OLLAMA:DEBUG", `Ollama returned HTTP ${response.status} in ${elapsed}ms`);
-      throw new Error(`Ollama returned HTTP ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`Ollama returned HTTP ${response.status}`);
     const content = data?.message?.content;
-    if (typeof content !== "string" || !content.trim()) {
-      debugLog("OLLAMA:DEBUG", `Ollama returned empty response in ${elapsed}ms`);
-      throw new Error("Ollama returned an empty response");
-    }
-    debugLog("OLLAMA:DEBUG", `✓ Ollama response received in ${elapsed}ms: "${content.slice(0, 50).replace(/\n/g, ' ')}..."`);
-    return { content: content.trim(), model: data?.model || OLLAMA_DEFAULT_MODEL, provider: "ollama" };
-  } catch (err) {
-    const elapsed = Date.now() - start;
-    debugLog("OLLAMA:DEBUG", `✗ Ollama failed in ${elapsed}ms (${err.message}) -> falling back`);
-    throw err;
+    if (typeof content !== "string" || !content.trim()) throw new Error("Ollama returned an empty response");
+    return { content, model: data?.model || OLLAMA_DEFAULT_MODEL, provider: "ollama" };
   } finally { clearTimeout(timeout); }
 }
-
 async function pollinationsChat(messages) {
-  const start = Date.now();
-  debugLog("POLLINATIONS:DEBUG", `Attempting primary Pollinations API: ${POLLINATIONS_BASE_URL}/v1/chat/completions (model=${POLLINATIONS_MODEL})`);
-  
-  // Strategy 1: Configured POLLINATIONS_BASE_URL
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), Math.min(AI_TIMEOUT_MS, 15_000));
-    try {
-      const headers = { "content-type": "application/json", accept: "application/json" };
-      if (POLLINATIONS_API_KEY) headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
-      const response = await fetch(`${POLLINATIONS_BASE_URL}/v1/chat/completions`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ model: POLLINATIONS_MODEL, messages, stream: false }),
-        signal: controller.signal,
-      });
-      const elapsed = Date.now() - start;
-      const data = await response.json().catch(() => ({}));
-      if (response.ok) {
-        const content = data?.choices?.[0]?.message?.content;
-        if (typeof content === "string" && content.trim()) {
-          debugLog("POLLINATIONS:DEBUG", `✓ Primary Pollinations success in ${elapsed}ms: "${content.slice(0, 60).replace(/\n/g, ' ')}..."`);
-          return { content: content.trim(), model: data?.model || POLLINATIONS_MODEL, provider: "pollinations" };
-        }
-      }
-      debugLog("POLLINATIONS:DEBUG", `Primary returned HTTP ${response.status} in ${elapsed}ms; trying OpenAI endpoint...`);
-    } finally { clearTimeout(timeout); }
-  } catch (err) {
-    debugLog("POLLINATIONS:DEBUG", `Primary Pollinations error (${err.message}); trying OpenAI endpoint...`);
-  }
-
-  // Strategy 2: Fast text.pollinations.ai/openai/chat/completions
-  try {
-    const fstart = Date.now();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12_000);
-    try {
-      const response = await fetch("https://text.pollinations.ai/openai/chat/completions", {
-        method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json" },
-        body: JSON.stringify({ messages, stream: false }),
-        signal: controller.signal,
-      });
-      const elapsed = Date.now() - fstart;
-      const data = await response.json().catch(() => ({}));
-      if (response.ok) {
-        const content = data?.choices?.[0]?.message?.content;
-        if (typeof content === "string" && content.trim()) {
-          debugLog("POLLINATIONS:DEBUG", `✓ OpenAI endpoint success in ${elapsed}ms: "${content.slice(0, 60).replace(/\n/g, ' ')}..."`);
-          return { content: content.trim(), model: data?.model || "gpt-oss-20b", provider: "pollinations_openai" };
-        }
-      }
-      debugLog("POLLINATIONS:DEBUG", `OpenAI endpoint returned HTTP ${response.status}; trying direct text endpoint...`);
-    } finally { clearTimeout(timeout); }
-  } catch (err) {
-    debugLog("POLLINATIONS:DEBUG", `OpenAI endpoint error: ${err.message}; trying direct text endpoint...`);
-  }
-
-  // Strategy 3: Direct text.pollinations.ai raw POST
-  const directStart = Date.now();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12_000);
+  const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
   try {
-    const response = await fetch("https://text.pollinations.ai/", {
+    const headers = { "content-type": "application/json", accept: "application/json" };
+    if (POLLINATIONS_API_KEY) headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
+    const response = await fetch(`${POLLINATIONS_BASE_URL}/v1/chat/completions`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ messages }),
+      headers,
+      body: JSON.stringify({ model: POLLINATIONS_MODEL, messages, stream: false }),
       signal: controller.signal,
     });
-    const elapsed = Date.now() - directStart;
-    const text = await response.text();
-    if (response.ok && text.trim()) {
-      debugLog("POLLINATIONS:DEBUG", `✓ Direct text endpoint success in ${elapsed}ms: "${text.slice(0, 60).replace(/\n/g, ' ')}..."`);
-      return { content: text.trim(), model: "pollinations-direct", provider: "pollinations_direct" };
-    }
-    throw new Error(`Direct Pollinations returned HTTP ${response.status}: ${text.slice(0, 100)}`);
-  } catch (err) {
-    debugLog("POLLINATIONS:DEBUG", `✗ All Pollinations endpoints failed. Last error: ${err.message}`);
-    throw err;
-  } finally { clearTimeout(timeout); }
-}
-
-async function geminiChat(messages) {
-  if (!GEMINI_API_KEY || GEMINI_API_KEY === "MY_GEMINI_API_KEY") return null;
-  const start = Date.now();
-  debugLog("GEMINI:DEBUG", `Attempting Gemini API chat...`);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
-  try {
-    const contents = messages.map((m) => ({
-      role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content }],
-    }));
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ contents }),
-      signal: controller.signal,
-    });
-    const elapsed = Date.now() - start;
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      debugLog("GEMINI:DEBUG", `Gemini returned HTTP ${res.status}: ${errText.slice(0, 150)}`);
-      return null;
-    }
-    const data = await res.json();
-    const content = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (typeof content === "string" && content.trim()) {
-      debugLog("GEMINI:DEBUG", `✓ Gemini reply generated in ${elapsed}ms: "${content.slice(0, 60)}..."`);
-      return { content: content.trim(), model: "gemini-2.0-flash", provider: "gemini" };
-    }
-    return null;
-  } catch (err) {
-    debugLog("GEMINI:DEBUG", `Gemini chat error: ${err.message}`);
-    return null;
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(`Pollinations returned HTTP ${response.status}`);
+    const content = data?.choices?.[0]?.message?.content;
+    if (typeof content !== "string" || !content.trim()) throw new Error("Pollinations returned an empty response");
+    return { content, model: data?.model || POLLINATIONS_MODEL, provider: "pollinations" };
   } finally { clearTimeout(timeout); }
 }
 
@@ -671,8 +530,12 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
       }
 
       if (existing) {
-        const [instPrefix] = (existing.instanceName || "").split("_");
-        if (existing.phoneNumber !== phoneNumber && instPrefix !== deviceId) {
+        if (existing.deviceId && existing.deviceId !== deviceId) {
+          const error = new Error("This instance is already linked to another device");
+          error.status = 409;
+          throw error;
+        }
+        if (existing.phoneNumber && existing.phoneNumber !== phoneNumber) {
           const error = new Error("This device is already linked to a different WhatsApp number");
           error.status = 409;
           throw error;
@@ -710,15 +573,9 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
 
       const otherDeviceId = store.instances[instanceName];
       if (otherDeviceId && otherDeviceId !== deviceId) {
-        const [instPrefix] = instanceName.split("_");
-        if (instPrefix === deviceId) {
-          // Same hardware checksum! Auto-link to this device
-          store.instances[instanceName] = deviceId;
-        } else {
-          const error = new Error("This WhatsApp number is already linked to another device");
-          error.status = 409;
-          throw error;
-        }
+        const error = new Error("This WhatsApp number is already linked to another device");
+        error.status = 409;
+        throw error;
       }
 
       // Do not delete on a failed create unless this request can prove it created the instance.
@@ -882,132 +739,31 @@ app.post("/api/instance/release", verifyDeviceRequest, async (req, res) => {
 });
 
 app.post("/api/chat", verifyDeviceRequest, async (req, res) => {
-  const reqStart = Date.now();
   const record = getDeviceRecord(req.deviceId);
-  if (!record) {
-    debugLog("AI:DEBUG", `Rejecting /api/chat: device ${req.deviceId} is not linked to an instance`);
-    return jsonError(res, 404, "Device is not linked to an instance");
-  }
+  if (!record) return jsonError(res, 404, "Device is not linked to an instance");
   const messages = chatMessagesFromBody(req.body);
-  if (!messages || messages.length === 0) {
-    debugLog("AI:DEBUG", `Rejecting /api/chat: empty prompt or messages`);
-    return jsonError(res, 400, "Provide a non-empty prompt or messages array");
-  }
-  const promptChars = messages.reduce((sum, message) => sum + message.content.length, 0);
-  if (promptChars > MAX_PROMPT_CHARS) {
-    debugLog("AI:DEBUG", `Rejecting /api/chat: prompt too long (${promptChars} chars)`);
-    return jsonError(res, 413, "Prompt is too long");
-  }
-  if (aiQueue.length >= MAX_AI_QUEUE && aiActive >= MAX_AI_CONCURRENCY) {
-    debugLog("AI:DEBUG", `Rejecting /api/chat: queue full (${aiQueue.length} waiting, ${aiActive} active)`);
-    return jsonError(res, 429, "AI queue is full; retry shortly");
-  }
-
-  debugLog("AI:DEBUG", `Incoming /api/chat from device=${req.deviceId} (messages=${messages.length}, totalChars=${promptChars})`);
-  debugLog("AI:DEBUG", `Prompt preview: [${messages[0]?.role}]: "${messages[0]?.content.slice(0, 80).replace(/\n/g, ' ')}..."`);
-
+  if (!messages || messages.length === 0) return jsonError(res, 400, "Provide a non-empty prompt or messages array");
+  if (messages.reduce((sum, message) => sum + message.content.length, 0) > MAX_PROMPT_CHARS) return jsonError(res, 413, "Prompt is too long");
+  if (aiQueue.length >= MAX_AI_QUEUE && aiActive >= MAX_AI_CONCURRENCY) return jsonError(res, 429, "AI queue is full; retry shortly");
   try {
     const result = await runAiTask(async () => {
-      // Step 1: Ollama (fast timeout)
       try {
         return await ollamaChat(messages);
-      } catch (ollamaError) {
-        debugLog("AI:DEBUG", `Ollama unavailable (${ollamaError.message}); trying secondary AI...`);
-
-        // Step 2: Gemini (if configured)
-        if (GEMINI_API_KEY && GEMINI_API_KEY !== "MY_GEMINI_API_KEY") {
-          try {
-            const geminiResult = await geminiChat(messages);
-            if (geminiResult) return geminiResult;
-          } catch (geminiError) {
-            debugLog("AI:DEBUG", `Gemini fallback failed (${geminiError.message}); trying Pollinations...`);
-          }
-        }
-
-        // Step 3: Pollinations (multi-endpoint fallback)
+      } catch (primaryError) {
+        process.stderr.write(`[AI:FALLBACK] Primary Ollama failed (${primaryError?.message || "unknown error"}). Attempting Pollinations fallback.\n`);
         try {
           return await pollinationsChat(messages);
-        } catch (pollinationsError) {
-          const error = new Error("All AI providers are currently unavailable");
-          error.cause = { ollama: ollamaError?.message, pollinations: pollinationsError?.message };
+        } catch (fallbackError) {
+          const error = new Error("AI providers are currently unavailable");
+          error.cause = { primary: primaryError?.message, fallback: fallbackError?.message };
           throw error;
         }
       }
     });
-
-    const totalElapsed = Date.now() - reqStart;
-    debugLog("AI:DEBUG", `✓ AI reply generated successfully in ${totalElapsed}ms via ${result.provider} (${result.content.length} chars)`);
     return res.json({ ok: true, response: result.content, model: result.model, provider: result.provider });
   } catch (error) {
-    const totalElapsed = Date.now() - reqStart;
-    debugLog("AI:DEBUG", `✗ AI generation failed after ${totalElapsed}ms: ${error instanceof Error ? error.message : String(error)}`);
-    return jsonError(res, 502, error instanceof Error ? error.message : "AI request failed", error.cause);
+    return jsonError(res, 502, error instanceof Error ? error.message : "AI request failed");
   }
-});
-
-app.post("/api/ai/transcribe", verifyDeviceRequest, async (req, res) => {
-  const reqStart = Date.now();
-  const record = getDeviceRecord(req.deviceId);
-  if (!record) return jsonError(res, 404, "Device is not linked to an instance");
-  const audioBase64 = req.body?.audioBase64;
-  const mimeType = req.body?.mimeType || "audio/ogg";
-  if (!audioBase64 || typeof audioBase64 !== "string") {
-    return jsonError(res, 400, "audioBase64 string is required");
-  }
-
-  debugLog("TRANSCRIBE:DEBUG", `Received transcription request from device=${req.deviceId}, mime=${mimeType}, b64Bytes=${audioBase64.length}`);
-
-  // If Gemini API key is configured, use multimodal Gemini for verbatim audio transcription
-  if (GEMINI_API_KEY && GEMINI_API_KEY !== "MY_GEMINI_API_KEY") {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 25_000);
-      const cleanB64 = audioBase64.replace(/^data:[^;]+;base64,/, "").trim();
-      const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              {
-                inline_data: {
-                  mime_type: mimeType.split(";")[0].trim(),
-                  data: cleanB64
-                }
-              },
-              {
-                text: "Accurately transcribe this voice recording word-for-word in its original language. Output only the verbatim transcription text without conversational filler or quotation marks."
-              }
-            ]
-          }]
-        }),
-        signal: controller.signal
-      });
-      clearTimeout(timeout);
-      if (geminiRes.ok) {
-        const data = await geminiRes.json();
-        const transcript = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-        if (transcript) {
-          const totalElapsed = Date.now() - reqStart;
-          debugLog("TRANSCRIBE:DEBUG", `✓ Audio transcribed by Gemini in ${totalElapsed}ms: "${transcript.slice(0, 80)}..."`);
-          return res.json({ ok: true, transcript, provider: "gemini" });
-        }
-      } else {
-        const errText = await geminiRes.text();
-        debugLog("TRANSCRIBE:DEBUG", `Gemini transcribe HTTP ${geminiRes.status}: ${errText.slice(0, 150)}`);
-      }
-    } catch (e) {
-      debugLog("TRANSCRIBE:DEBUG", `Gemini transcribe error: ${e.message}`);
-    }
-  }
-
-  // Graceful fallback: return a clear indicator
-  debugLog("TRANSCRIBE:DEBUG", "Providing voice message placeholder transcript");
-  return res.json({
-    ok: true,
-    transcript: "Voice note received and ready for playback.",
-    provider: "local_transcript"
-  });
 });
 
 app.get("/api/instance/status", verifyDeviceRequest, async (req, res) => {
@@ -1145,7 +901,6 @@ app.use((error, _req, res, _next) => {
 await loadStore();
 const server = app.listen(PORT, HOST, () => {
   process.stdout.write(`HexaSynq Gateway listening on ${HOST}:${PORT}\n`);
-  void checkInternetConnectivity();
 });
 
 let shuttingDown = false;
