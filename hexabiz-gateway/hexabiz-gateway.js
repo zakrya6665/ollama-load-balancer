@@ -46,6 +46,16 @@ const OLLAMA_DEFAULT_MODEL = process.env.OLLAMA_DEFAULT_MODEL || "synq:latest";
 const POLLINATIONS_BASE_URL = (process.env.POLLINATIONS_BASE_URL || "https://gen.pollinations.ai").replace(/\/+$/, "");
 const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "";
 const POLLINATIONS_MODEL = process.env.POLLINATIONS_MODEL || "openai/gpt-5.4-nano";
+// Media-specific Pollinations model names (configurable without code changes)
+const POLLINATIONS_AUDIO_MODEL = process.env.POLLINATIONS_AUDIO_MODEL || "openai-audio";
+const POLLINATIONS_IMAGE_MODEL = process.env.POLLINATIONS_IMAGE_MODEL || "openai";
+// Maximum decoded media bytes accepted by the media endpoints.
+// Base64 strings are ~33 % larger, so the JSON body limit must be raised accordingly.
+// Default: 8 MB decoded  →  ~10.7 MB base64 JSON body (MAX_BODY_BYTES covers the rest).
+const MAX_MEDIA_DECODED_BYTES = positiveInt(process.env.MAX_MEDIA_DECODED_BYTES, 8 * 1_048_576);
+// Per-IP rate limit for media endpoints (requests per window).
+const MEDIA_RATE_LIMIT_WINDOW_MS = positiveInt(process.env.MEDIA_RATE_LIMIT_WINDOW_MS, 60_000);
+const MEDIA_RATE_LIMIT_MAX = positiveInt(process.env.MEDIA_RATE_LIMIT_MAX, 20);
 const ENROLLMENT_KEY = process.env.ENROLLMENT_KEY || process.env.APP_ENROLLMENT_KEY || "";
 const WEBHOOK_SECRET =
   process.env.WEBHOOK_SECRET ||
@@ -159,6 +169,31 @@ const webhookDedupeCache = new Map();
 const webhookInFlight = new Set();
 let aiActive = 0;
 const aiQueue = [];
+
+// Per-IP sliding-window rate limit map for media endpoints.
+// Key: IP address string. Value: { count, windowStart }.
+const mediaRateLimitMap = new Map();
+
+/**
+ * Checks and updates the per-IP rate limit for media endpoints.
+ * Returns true if the request is allowed, false if the limit is exceeded.
+ */
+function checkMediaRateLimit(ip) {
+  const now = Date.now();
+  let entry = mediaRateLimitMap.get(ip);
+  if (!entry || (now - entry.windowStart) >= MEDIA_RATE_LIMIT_WINDOW_MS) {
+    entry = { count: 0, windowStart: now };
+  }
+  entry.count += 1;
+  mediaRateLimitMap.set(ip, entry);
+  // Periodically evict stale entries so the map does not grow unbounded.
+  if (mediaRateLimitMap.size > 10_000) {
+    for (const [key, value] of mediaRateLimitMap) {
+      if ((now - value.windowStart) >= MEDIA_RATE_LIMIT_WINDOW_MS) mediaRateLimitMap.delete(key);
+    }
+  }
+  return entry.count <= MEDIA_RATE_LIMIT_MAX;
+}
 
 async function loadStore() {
   await fs.mkdir(path.dirname(MAPPINGS_FILE_PATH), { recursive: true });
@@ -451,10 +486,14 @@ async function ollamaChat(messages) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
   try {
+    // The Ollama model has instructions baked in via a Modelfile system prompt.
+    // Strip any system message from the app before forwarding to avoid duplication
+    // or conflicts with the model's built-in behaviour.
+    const ollamaMessages = messages.filter((m) => m.role !== "system");
     const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: OLLAMA_DEFAULT_MODEL, messages, stream: false }),
+      body: JSON.stringify({ model: OLLAMA_DEFAULT_MODEL, messages: ollamaMessages, stream: false }),
       signal: controller.signal,
     });
     const data = await response.json().catch(() => ({}));
@@ -483,6 +522,252 @@ async function pollinationsChat(messages) {
     return { content, model: data?.model || POLLINATIONS_MODEL, provider: "pollinations" };
   } finally { clearTimeout(timeout); }
 }
+
+// ============================================================================
+// Media endpoint helpers
+// ============================================================================
+
+/**
+ * Middleware: per-IP rate limit for the two media endpoints.
+ * Uses the leftmost forwarded IP when trust proxy is enabled.
+ */
+function requireMediaRateLimit(req, res, next) {
+  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  if (!checkMediaRateLimit(ip)) {
+    return jsonError(res, 429, "Media rate limit exceeded; retry after a short wait");
+  }
+  return next();
+}
+
+/**
+ * Validates and decodes a base64 string field from req.body.
+ * Returns a Buffer on success or calls jsonError and returns null.
+ * The fieldName is used only for the error message, never echoed as-is.
+ */
+function decodeBase64Field(res, value, fieldName) {
+  if (typeof value !== "string" || value.length === 0) {
+    jsonError(res, 400, `${fieldName} must be a non-empty base64 string`);
+    return null;
+  }
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+    jsonError(res, 400, `${fieldName} contains invalid base64 characters`);
+    return null;
+  }
+  const decoded = Buffer.from(value, "base64");
+  if (decoded.length === 0) {
+    jsonError(res, 400, `${fieldName} decoded to zero bytes`);
+    return null;
+  }
+  if (decoded.length > MAX_MEDIA_DECODED_BYTES) {
+    jsonError(res, 413, `${fieldName} exceeds the maximum allowed size of ${MAX_MEDIA_DECODED_BYTES} bytes decoded`);
+    return null;
+  }
+  return decoded;
+}
+
+/**
+ * POSTs a JSON body to a Pollinations text endpoint and returns the parsed response.
+ * Returns { ok: true, data } or throws an Error with a safe message.
+ */
+async function pollinationsMediaRequest(endpoint, bodyObj) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+  try {
+    const headers = { "content-type": "application/json", accept: "application/json" };
+    if (POLLINATIONS_API_KEY) headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
+    const response = await fetch(`${POLLINATIONS_BASE_URL}${endpoint}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(bodyObj),
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let data;
+    try { data = text ? JSON.parse(text) : {}; } catch { data = {}; }
+    if (!response.ok) {
+      const error = new Error(`Pollinations returned HTTP ${response.status}`);
+      error.status = response.status >= 500 ? 502 : response.status;
+      throw error;
+    }
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Extracts the assistant content string from an OpenAI-compatible
+ * chat-completions response envelope.  Returns null on any parse failure.
+ */
+function extractOpenAiContent(data) {
+  try {
+    const content = data?.choices?.[0]?.message?.content;
+    return typeof content === "string" && content.trim() ? content.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+// ============================================================================
+// POST /api/media/transcribe
+// ============================================================================
+
+app.post("/api/media/transcribe", requireEnrollment, requireMediaRateLimit, async (req, res) => {
+  // Validate mimeType first (no sensitive data involved).
+  const mimeType = typeof req.body?.mimeType === "string" ? req.body.mimeType.trim() : "";
+  const ALLOWED_AUDIO_MIMES = new Set([
+    "audio/ogg", "audio/mpeg", "audio/mp4", "audio/wav", "audio/webm",
+    "audio/ogg; codecs=opus",
+  ]);
+  const normalizedMime = mimeType.split(";")[0].trim().toLowerCase();
+  if (!normalizedMime || !ALLOWED_AUDIO_MIMES.has(normalizedMime) && !normalizedMime.startsWith("audio/")) {
+    return jsonError(res, 400, "mimeType must be a supported audio MIME type (e.g. audio/ogg)");
+  }
+
+  // Validate and size-check the base64 audio payload.
+  const decoded = decodeBase64Field(res, req.body?.audio, "audio");
+  if (!decoded) return; // decodeBase64Field already sent an error response.
+
+  const audioBase64 = req.body.audio; // validated above
+
+  if (aiQueue.length >= MAX_AI_QUEUE && aiActive >= MAX_AI_CONCURRENCY) {
+    return jsonError(res, 429, "AI queue is full; retry shortly");
+  }
+
+  try {
+    const result = await runAiTask(async () => {
+      const audioFormat = normalizedMime.replace("audio/", "").replace("; codecs=opus", "").trim() || "ogg";
+
+      const body = {
+        model: POLLINATIONS_AUDIO_MODEL,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Please transcribe this voice message accurately. Return only the transcription text, nothing else.",
+              },
+              {
+                type: "input_audio",
+                input_audio: {
+                  data: audioBase64,
+                  format: audioFormat,
+                },
+              },
+            ],
+          },
+        ],
+        max_tokens: 1024,
+      };
+
+      const data = await pollinationsMediaRequest("/openai", body);
+      const transcript = extractOpenAiContent(data);
+      if (!transcript) {
+        const error = new Error("Pollinations returned an empty transcription");
+        error.status = 502;
+        throw error;
+      }
+      return transcript;
+    });
+
+    return res.json({ ok: true, transcript: result });
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 502;
+    // Never forward raw upstream error text; log it server-side only.
+    process.stderr.write(`[MEDIA:TRANSCRIBE] Error: ${error instanceof Error ? error.message : "unknown"}\n`);
+    return jsonError(res, status, status === 429 ? "AI queue is full; retry shortly" : "Transcription failed; please retry");
+  }
+});
+
+// ============================================================================
+// POST /api/media/analyse
+// ============================================================================
+
+app.post("/api/media/analyse", requireEnrollment, requireMediaRateLimit, async (req, res) => {
+  // Validate and size-check the base64 image payload.
+  const decoded = decodeBase64Field(res, req.body?.imageBase64, "imageBase64");
+  if (!decoded) return;
+
+  const imageBase64 = req.body.imageBase64; // validated above
+  const dataUri = `data:image/jpeg;base64,${imageBase64}`;
+
+  if (aiQueue.length >= MAX_AI_QUEUE && aiActive >= MAX_AI_CONCURRENCY) {
+    return jsonError(res, 429, "AI queue is full; retry shortly");
+  }
+
+  try {
+    const result = await runAiTask(async () => {
+      const body = {
+        model: POLLINATIONS_IMAGE_MODEL,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: `Analyse this image and respond in this exact JSON format:
+{
+  "description": "<1-2 sentence description of what you see>",
+  "quality": "<good|average|poor>",
+  "appraisal": "<if quality is good, write a warm enthusiastic compliment for the sender (1 sentence). If average or poor, leave this field as an empty string>"
+}
+Return only valid JSON. Do not add markdown fences or any other text outside the JSON object.`,
+              },
+              {
+                type: "image_url",
+                image_url: { url: dataUri, detail: "auto" },
+              },
+            ],
+          },
+        ],
+        max_tokens: 512,
+      };
+
+      const data = await pollinationsMediaRequest("/openai", body);
+      const raw = extractOpenAiContent(data);
+      if (!raw) {
+        const error = new Error("Pollinations returned an empty image analysis");
+        error.status = 502;
+        throw error;
+      }
+      return raw;
+    });
+
+    // Parse and validate the structured image response.
+    // Malformed JSON from the model is handled gracefully.
+    let description = "";
+    let quality = "unknown";
+    let appraisal = null;
+
+    try {
+      const cleaned = result
+        .replace(/^```json\s*/i, "")
+        .replace(/^```\s*/i, "")
+        .replace(/```\s*$/, "")
+        .trim();
+      const parsed = JSON.parse(cleaned);
+      description = typeof parsed.description === "string" ? parsed.description.trim() : result.trim();
+      quality = typeof parsed.quality === "string" && ["good", "average", "poor"].includes(parsed.quality.toLowerCase())
+        ? parsed.quality.toLowerCase()
+        : "unknown";
+      appraisal = quality === "good" && typeof parsed.appraisal === "string" && parsed.appraisal.trim()
+        ? parsed.appraisal.trim()
+        : null;
+    } catch {
+      // Model did not return valid JSON; surface the raw text as the description.
+      description = result.trim();
+      quality = "unknown";
+      appraisal = null;
+    }
+
+    return res.json({ ok: true, description, quality, appraisal });
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 502;
+    process.stderr.write(`[MEDIA:ANALYSE] Error: ${error instanceof Error ? error.message : "unknown"}\n`);
+    return jsonError(res, status, status === 429 ? "AI queue is full; retry shortly" : "Image analysis failed; please retry");
+  }
+});
 
 app.get("/", (_req, res) => res.json({ service: "HexaSynq Gateway", ok: true }));
 app.get("/health/live", (_req, res) => res.json({ ok: true, status: "live" }));
