@@ -47,7 +47,7 @@ const POLLINATIONS_BASE_URL = (process.env.POLLINATIONS_BASE_URL || "https://gen
 const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "";
 const POLLINATIONS_MODEL = process.env.POLLINATIONS_MODEL || "openai/gpt-5.4-nano";
 // Media-specific Pollinations model names (configurable without code changes)
-const POLLINATIONS_AUDIO_MODEL = process.env.POLLINATIONS_AUDIO_MODEL || "openai-audio";
+const POLLINATIONS_AUDIO_MODEL = process.env.POLLINATIONS_AUDIO_MODEL || "microsoft/mai-transcribe-2";
 const POLLINATIONS_IMAGE_MODEL = process.env.POLLINATIONS_IMAGE_MODEL || "openai";
 // Maximum decoded media bytes accepted by the media endpoints.
 // Base64 strings are ~33 % larger, so the JSON body limit must be raised accordingly.
@@ -79,7 +79,7 @@ const DATA_DIR = process.env.DATA_DIR || "/data";
 const MAPPINGS_FILE_PATH = process.env.MAPPINGS_FILE_PATH || path.join(DATA_DIR, "gateway_mappings.json");
 const REQUEST_TIMEOUT_MS = positiveInt(process.env.REQUEST_TIMEOUT_MS, 15_000);
 const AI_TIMEOUT_MS = positiveInt(process.env.AI_TIMEOUT_MS, 45_000);
-const MAX_BODY_BYTES = positiveInt(process.env.MAX_BODY_BYTES, 1_048_576);
+const MAX_BODY_BYTES = positiveInt(process.env.MAX_BODY_BYTES, 12 * 1_048_576);
 const MAX_CLOCK_SKEW_MS = positiveInt(process.env.MAX_CLOCK_SKEW_MS, 5 * 60_000);
 const NONCE_TTL_MS = positiveInt(process.env.NONCE_TTL_MS, 10 * 60_000);
 const MAX_NONCES = positiveInt(process.env.MAX_NONCES, 20_000);
@@ -612,73 +612,157 @@ function extractOpenAiContent(data) {
 // POST //v1/audio/transcriptions
 // ============================================================================
 
-app.post("/v1/audio/transcriptions", requireEnrollment, requireMediaRateLimit, async (req, res) => {
-  // Validate mimeType first (no sensitive data involved).
-  const mimeType = typeof req.body?.mimeType === "string" ? req.body.mimeType.trim() : "";
-  const ALLOWED_AUDIO_MIMES = new Set([
-    "audio/ogg", "audio/mpeg", "audio/mp4", "audio/wav", "audio/webm",
-    "audio/ogg; codecs=opus",
-  ]);
-  const normalizedMime = mimeType.split(";")[0].trim().toLowerCase();
-  if (!normalizedMime || !ALLOWED_AUDIO_MIMES.has(normalizedMime) && !normalizedMime.startsWith("audio/")) {
-    return jsonError(res, 400, "mimeType must be a supported audio MIME type (e.g. audio/ogg)");
-  }
 
-  // Validate and size-check the base64 audio payload.
-  const decoded = decodeBase64Field(res, req.body?.audio, "audio");
-  if (!decoded) return; // decodeBase64Field already sent an error response.
+app.post("/v1/audio/transcriptions",
+  requireEnrollment,
+  requireMediaRateLimit,
+  async (req, res) => {
+    const mimeType =
+      typeof req.body?.mimeType === "string"
+        ? req.body.mimeType.trim().toLowerCase()
+        : "";
 
-  const audioBase64 = req.body.audio; // validated above
+    const normalizedMime = mimeType.split(";")[0].trim();
 
-  if (aiQueue.length >= MAX_AI_QUEUE && aiActive >= MAX_AI_CONCURRENCY) {
-    return jsonError(res, 429, "AI queue is full; retry shortly");
-  }
+    const AUDIO_FORMATS = {
+      "audio/ogg": { extension: "ogg", mime: "audio/ogg" },
+      "audio/mpeg": { extension: "mp3", mime: "audio/mpeg" },
+      "audio/mp3": { extension: "mp3", mime: "audio/mpeg" },
+      "audio/mp4": { extension: "m4a", mime: "audio/mp4" },
+      "audio/x-m4a": { extension: "m4a", mime: "audio/mp4" },
+      "audio/wav": { extension: "wav", mime: "audio/wav" },
+      "audio/x-wav": { extension: "wav", mime: "audio/wav" },
+      "audio/webm": { extension: "webm", mime: "audio/webm" },
+    };
 
-  try {
-    const result = await runAiTask(async () => {
-      const audioFormat = normalizedMime.replace("audio/", "").replace("; codecs=opus", "").trim() || "ogg";
+    const audioFormat = AUDIO_FORMATS[normalizedMime];
 
-      const body = {
-        model: POLLINATIONS_AUDIO_MODEL,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: "Please transcribe this voice message accurately. Return only the transcription text, nothing else.",
+    if (!audioFormat) {
+      return jsonError(
+        res,
+        400,
+        "Unsupported audio format. Use OGG, MP3, MP4/M4A, WAV, or WebM."
+      );
+    }
+
+    if (!POLLINATIONS_API_KEY) {
+      return jsonError(res, 503, "Transcription service is not configured");
+    }
+
+    const decoded = decodeBase64Field(res, req.body?.audio, "audio");
+    if (!decoded) return;
+
+    if (aiQueue.length >= MAX_AI_QUEUE && aiActive >= MAX_AI_CONCURRENCY) {
+      return jsonError(res, 429, "AI queue is full; retry shortly");
+    }
+
+    try {
+      const transcript = await runAiTask(async () => {
+        const form = new FormData();
+
+        form.set(
+          "file",
+          new Blob([decoded], { type: audioFormat.mime }),
+          `recording.${audioFormat.extension}`
+        );
+
+        form.set("model", POLLINATIONS_AUDIO_MODEL);
+        form.set("response_format", "json");
+        form.set("temperature", "0");
+
+        const controller = new AbortController();
+        const timeout = setTimeout(
+          () => controller.abort(),
+          AI_TIMEOUT_MS
+        );
+
+        try {
+          // Use Node.js 20's native fetch for multipart FormData.
+          // Do not set Content-Type manually: fetch adds the boundary.
+          const response = await globalThis.fetch(
+            `${POLLINATIONS_BASE_URL}/v1/audio/transcriptions`,
+            {
+              method: "POST",
+              headers: {
+                accept: "application/json",
+                authorization: `Bearer ${POLLINATIONS_API_KEY}`,
               },
-              {
-                type: "input_audio",
-                input_audio: {
-                  data: audioBase64,
-                  format: audioFormat,
-                },
-              },
-            ],
-          },
-        ],
-        max_tokens: 1024,
-      };
+              body: form,
+              signal: controller.signal,
+            }
+          );
 
-      const data = await pollinationsMediaRequest("/openai", body);
-      const transcript = extractOpenAiContent(data);
-      if (!transcript) {
-        const error = new Error("Pollinations returned an empty transcription");
-        error.status = 502;
-        throw error;
-      }
-      return transcript;
-    });
+          const responseText = await response.text();
 
-    return res.json({ ok: true, transcript: result });
-  } catch (error) {
-    const status = Number.isInteger(error?.status) ? error.status : 502;
-    // Never forward raw upstream error text; log it server-side only.
-    process.stderr.write(`[MEDIA:TRANSCRIBE] Error: ${error instanceof Error ? error.message : "unknown"}\n`);
-    return jsonError(res, status, status === 429 ? "AI queue is full; retry shortly" : "Transcription failed; please retry");
+          let data;
+          try {
+            data = responseText ? JSON.parse(responseText) : {};
+          } catch {
+            data = { text: responseText };
+          }
+
+          if (!response.ok) {
+            const error = new Error(
+              `Pollinations transcription returned HTTP ${response.status}`
+            );
+
+            error.status = response.status === 429
+              ? 429
+              : response.status >= 500
+                ? 502
+                : response.status;
+
+            throw error;
+          }
+
+          const text =
+            typeof data?.text === "string"
+              ? data.text.trim()
+              : typeof data?.transcript === "string"
+                ? data.transcript.trim()
+                : typeof data === "string"
+                  ? data.trim()
+                  : "";
+
+          if (!text) {
+            const error = new Error(
+              "Pollinations returned an empty transcription"
+            );
+            error.status = 502;
+            throw error;
+          }
+
+          return text;
+        } finally {
+          clearTimeout(timeout);
+        }
+      });
+
+      return res.json({ ok: true, transcript });
+    } catch (error) {
+      const status = Number.isInteger(error?.status)
+        ? error.status
+        : error?.name === "AbortError"
+          ? 504
+          : 502;
+
+      process.stderr.write(
+        `[MEDIA:TRANSCRIBE] Failed with status ${status}\n`
+      );
+
+      return jsonError(
+        res,
+        status,
+        status === 429
+          ? "Transcription rate limit reached; retry shortly"
+          : status === 504
+            ? "Transcription timed out; please retry"
+            : "Transcription failed; please retry"
+      );
+    }
   }
-});
+);
+
 
 // ============================================================================
 // POST /api/media/analyse
