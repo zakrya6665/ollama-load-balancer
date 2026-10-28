@@ -609,10 +609,10 @@ function extractOpenAiContent(data) {
 }
 
 // ============================================================================
-// POST /api/media/transcribe
+// POST //v1/audio/transcriptions
 // ============================================================================
 
-app.post("/api/media/transcribe", requireEnrollment, requireMediaRateLimit, async (req, res) => {
+app.post("/v1/audio/transcriptions", requireEnrollment, requireMediaRateLimit, async (req, res) => {
   // Validate mimeType first (no sensitive data involved).
   const mimeType = typeof req.body?.mimeType === "string" ? req.body.mimeType.trim() : "";
   const ALLOWED_AUDIO_MIMES = new Set([
