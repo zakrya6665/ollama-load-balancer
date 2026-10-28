@@ -609,11 +609,11 @@ function extractOpenAiContent(data) {
 }
 
 // ============================================================================
-// POST //v1/audio/transcriptions
+// POST /api/media/transcribe & /v1/audio/transcriptions
 // ============================================================================
 
-
-app.post("/v1/audio/transcriptions",
+app.post(
+  ["/api/media/transcribe", "/v1/audio/transcriptions"],
   requireEnrollment,
   requireMediaRateLimit,
   async (req, res) => {
@@ -646,7 +646,7 @@ app.post("/v1/audio/transcriptions",
     }
 
     if (!POLLINATIONS_API_KEY) {
-      return jsonError(res, 503, "Transcription service is not configured");
+      process.stderr.write("[MEDIA:TRANSCRIBE] Warning: POLLINATIONS_API_KEY is not set; sending request without auth\n");
     }
 
     const decoded = decodeBase64Field(res, req.body?.audio, "audio");
@@ -679,14 +679,18 @@ app.post("/v1/audio/transcriptions",
         try {
           // Use Node.js 20's native fetch for multipart FormData.
           // Do not set Content-Type manually: fetch adds the boundary.
+          const headers = {
+            accept: "application/json",
+          };
+          if (POLLINATIONS_API_KEY) {
+            headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
+          }
+
           const response = await globalThis.fetch(
             `${POLLINATIONS_BASE_URL}/v1/audio/transcriptions`,
             {
               method: "POST",
-              headers: {
-                accept: "application/json",
-                authorization: `Bearer ${POLLINATIONS_API_KEY}`,
-              },
+              headers,
               body: form,
               signal: controller.signal,
             }
