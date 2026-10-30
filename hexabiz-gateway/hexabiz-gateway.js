@@ -645,6 +645,21 @@ app.post(
       );
     }
 
+    let language = typeof req.body?.language === "string" ? req.body.language.trim().toLowerCase() : "";
+    if (!language) {
+      const ownerPhone = String(
+        req.body?.ownerPhone ||
+        req.body?.phoneNumber ||
+        req.headers["x-phone-number"] ||
+        req.headers["x-owner-phone"] ||
+        req.headers["x-instance-name"] ||
+        ""
+      ).replace(/\D/g, "");
+      if (ownerPhone.startsWith("92")) {
+        language = "ur";
+      }
+    }
+
     if (!POLLINATIONS_API_KEY) {
       process.stderr.write("[MEDIA:TRANSCRIBE] Warning: POLLINATIONS_API_KEY is not set; sending request without auth\n");
     }
@@ -669,6 +684,9 @@ app.post(
         form.set("model", POLLINATIONS_AUDIO_MODEL);
         form.set("response_format", "json");
         form.set("temperature", "0");
+        if (language) {
+          form.set("language", language);
+        }
 
         const controller = new AbortController();
         const timeout = setTimeout(
@@ -1223,7 +1241,8 @@ app.post("/webhook/evolution", (req, res) => {
   rememberOnce(webhookDedupeCache, dedupeKey, 10 * 60_000, 20_000);
   webhookInFlight.add(dedupeKey);
 
-  const message = data.message || data;
+  const rawMsg = data.message || data;
+  const { message: effectiveMsg, isViewOnce } = unwrapMessage(rawMsg);
   const rawJid = String(data.id || key.remoteJid || data.remoteJid || data.chatId || "");
   const presencesObj = data.presences && typeof data.presences === "object" ? data.presences : {};
   const firstPresence = Object.values(presencesObj)[0];
@@ -1239,9 +1258,10 @@ app.post("/webhook/evolution", (req, res) => {
     phoneNumber: cleanPhone,
     fromMe: String(key.fromMe ?? data.fromMe ?? false),
     timestamp: String(data.messageTimestamp || data.timestamp || body.date_time || body.timestamp || ""),
-    messageText: extractMessageText(message),
-    messageType: String(message && typeof message === "object" ? Object.keys(message).find((name) => name.endsWith("Message")) || "text" : "text"),
-    hasMedia: String(Boolean(message && typeof message === "object" && Object.keys(message).some((name) => name.endsWith("Message") && name !== "extendedTextMessage"))),
+    messageText: extractMessageText(rawMsg),
+    messageType: String(effectiveMsg && typeof effectiveMsg === "object" ? Object.keys(effectiveMsg).find((name) => name.endsWith("Message")) || "text" : "text"),
+    hasMedia: String(Boolean(effectiveMsg && typeof effectiveMsg === "object" && Object.keys(effectiveMsg).some((name) => name.endsWith("Message") && name !== "extendedTextMessage"))),
+    isViewOnce: String(isViewOnce),
     status: String(data.update?.status || data.status || ""),
     isOnline: String(isOnline),
     presenceState: presenceState,
