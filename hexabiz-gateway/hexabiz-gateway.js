@@ -26,13 +26,11 @@ for (const file of [".env", path.join(process.cwd(), ".env")]) {
           }
           if (!process.env[key]) process.env[key] = val;
         }
-        
+      
       }
     }
   } catch { /* ignore */ }
 }
-
-
 
 // HexaSynq Gateway — Node.js 20+, ESM
 // Required dependencies: express, helmet, node-fetch, firebase-admin
@@ -86,6 +84,16 @@ const MAX_NONCES = positiveInt(process.env.MAX_NONCES, 20_000);
 const MAX_AI_CONCURRENCY = positiveInt(process.env.MAX_AI_CONCURRENCY, 4);
 const MAX_AI_QUEUE = positiveInt(process.env.MAX_AI_QUEUE, 30);
 const MAX_PROMPT_CHARS = positiveInt(process.env.MAX_PROMPT_CHARS, 20_000);
+
+// AI Provider Configuration
+const AI_PROVIDER_RAW = (process.env.AI_PROVIDER || "HEXABIZ").trim().toUpperCase();
+const AI_PROVIDER = ["POLLINATIONS", "HEXABIZ"].includes(AI_PROVIDER_RAW)
+  ? AI_PROVIDER_RAW
+  : "HEXABIZ";
+const POLLINATIONS_MAX_COMPLETION_TOKENS = positiveInt(
+  process.env.POLLINATIONS_MAX_COMPLETION_TOKENS,
+  200
+);
 
 function positiveInt(value, fallback) {
   const parsed = Number.parseInt(value || "", 10);
@@ -503,24 +511,117 @@ async function ollamaChat(messages) {
     return { content, model: data?.model || OLLAMA_DEFAULT_MODEL, provider: "ollama" };
   } finally { clearTimeout(timeout); }
 }
+
 async function pollinationsChat(messages) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+
   try {
-    const headers = { "content-type": "application/json", accept: "application/json" };
-    if (POLLINATIONS_API_KEY) headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
-    const response = await fetch(`${POLLINATIONS_BASE_URL}/v1/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ model: POLLINATIONS_MODEL, messages, stream: false }),
-      signal: controller.signal,
-    });
+    const headers = {
+      "content-type": "application/json",
+      accept: "application/json",
+    };
+
+    if (POLLINATIONS_API_KEY) {
+      headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
+    }
+
+    const requestBody = {
+      model: POLLINATIONS_MODEL,
+      messages,
+      max_completion_tokens: POLLINATIONS_MAX_COMPLETION_TOKENS,
+      stream: false,
+      safe: true,
+      reasoning_effort: "none",
+      temperature: 0,
+    };
+
+    const response = await fetch(
+      `${POLLINATIONS_BASE_URL}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      }
+    );
+
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(`Pollinations returned HTTP ${response.status}`);
+
+    if (!response.ok) {
+      const error = new Error(
+        `Pollinations returned HTTP ${response.status}`
+      );
+      error.status = response.status;
+      throw error;
+    }
+
     const content = data?.choices?.[0]?.message?.content;
-    if (typeof content !== "string" || !content.trim()) throw new Error("Pollinations returned an empty response");
-    return { content, model: data?.model || POLLINATIONS_MODEL, provider: "pollinations" };
-  } finally { clearTimeout(timeout); }
+
+    if (typeof content !== "string" || !content.trim()) {
+      throw new Error("Pollinations returned an empty response");
+    }
+
+    return {
+      content,
+      model: data?.model || POLLINATIONS_MODEL,
+      provider: "pollinations",
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function generateChatReply(messages) {
+  const primaryProvider =
+    AI_PROVIDER === "POLLINATIONS" ? "pollinations" : "ollama";
+
+  const fallbackProvider =
+    AI_PROVIDER === "POLLINATIONS" ? "ollama" : "pollinations";
+
+  const providers = {
+    ollama: ollamaChat,
+    pollinations: pollinationsChat,
+  };
+
+  try {
+    const result = await providers[primaryProvider](messages);
+
+    return {
+      ...result,
+      fallbackUsed: false,
+    };
+  } catch (primaryError) {
+    process.stderr.write(
+      `[AI:FALLBACK] Primary provider ${primaryProvider} failed. ` +
+      `Attempting ${fallbackProvider}. Reason: ${
+        primaryError?.message || "unknown error"
+      }\n`
+    );
+
+    try {
+      const result = await providers[fallbackProvider](messages);
+
+      return {
+        ...result,
+        fallbackUsed: true,
+      };
+    } catch (fallbackError) {
+      process.stderr.write(
+        `[AI:ERROR] Both providers failed. Primary=${primaryProvider}, ` +
+        `Fallback=${fallbackProvider}\n`
+      );
+
+      const error = new Error("AI providers are currently unavailable");
+
+      error.cause = {
+        primary: primaryError?.message || "unknown error",
+        fallback: fallbackError?.message || "unknown error",
+      };
+
+      throw error;
+    }
+  }
 }
 
 // ============================================================================
@@ -536,7 +637,7 @@ function requireMediaRateLimit(req, res, next) {
   if (!checkMediaRateLimit(ip)) {
     return jsonError(res, 429, "Media rate limit exceeded; retry after a short wait");
   }
-  return next();
+  return next;
 }
 
 /**
@@ -848,9 +949,9 @@ Return only valid JSON. Do not add markdown fences or any other text outside the
 
     try {
       const cleaned = result
-        .replace(/^```json\s*/i, "")
-        .replace(/^```\s*/i, "")
-        .replace(/```\s*$/, "")
+        .replace(/^\`\`\`json\s*/i, "")
+        .replace(/^\`\`\`\s*/i, "")
+        .replace(/\`\`\`\s*$/, "")
         .trim();
       const parsed = JSON.parse(cleaned);
       description = typeof parsed.description === "string" ? parsed.description.trim() : result.trim();
@@ -1138,18 +1239,7 @@ app.post("/api/chat", verifyDeviceRequest, async (req, res) => {
   if (aiQueue.length >= MAX_AI_QUEUE && aiActive >= MAX_AI_CONCURRENCY) return jsonError(res, 429, "AI queue is full; retry shortly");
   try {
     const result = await runAiTask(async () => {
-      try {
-        return await ollamaChat(messages);
-      } catch (primaryError) {
-        process.stderr.write(`[AI:FALLBACK] Primary Ollama failed (${primaryError?.message || "unknown error"}). Attempting Pollinations fallback.\n`);
-        try {
-          return await pollinationsChat(messages);
-        } catch (fallbackError) {
-          const error = new Error("AI providers are currently unavailable");
-          error.cause = { primary: primaryError?.message, fallback: fallbackError?.message };
-          throw error;
-        }
-      }
+      return generateChatReply(messages);
     });
     return res.json({ ok: true, response: result.content, model: result.model, provider: result.provider });
   } catch (error) {
@@ -1178,7 +1268,35 @@ function webhookEventName(body) {
 function extractInstanceName(body) {
   return String(body?.instance || body?.instanceName || body?.data?.instance || body?.instance?.instanceName || "").trim();
 }
-function extractMessageText(message) {
+function unwrapMessage(msg) {
+  let current = msg;
+  let isViewOnce = false;
+  while (current && typeof current === "object") {
+    if (current.viewOnceMessage || current.viewOnceMessageV2 || current.viewOnceMessageV2Extension) {
+      isViewOnce = true;
+    }
+    const inner = current.viewOnceMessage?.message ||
+      current.viewOnceMessageV2?.message ||
+      current.viewOnceMessageV2Extension?.message ||
+      current.ephemeralMessage?.message ||
+      current.documentWithCaptionMessage?.message;
+    if (inner) {
+      current = inner;
+      continue;
+    }
+    break;
+  }
+  if (!isViewOnce && current && typeof current === "object") {
+    if (current.imageMessage?.viewOnce || current.videoMessage?.viewOnce || current.audioMessage?.viewOnce || current.documentMessage?.viewOnce || current.viewOnce) {
+      isViewOnce = true;
+    }
+  }
+  return { message: current, isViewOnce };
+}
+
+function extractMessageText(rawMessage) {
+  if (!rawMessage || typeof rawMessage !== "object") return "";
+  const { message, isViewOnce } = unwrapMessage(rawMessage);
   if (!message || typeof message !== "object") return "";
   const candidates = [
     message.conversation,
@@ -1193,8 +1311,17 @@ function extractMessageText(message) {
     message.interactiveResponseMessage?.body?.text,
     message.pollCreationMessage?.name,
   ];
-  const text = candidates.find((value) => typeof value === "string" && value.trim());
-  return typeof text === "string" ? text.trim() : "";
+  let text = candidates.find((value) => typeof value === "string" && value.trim());
+  if (!text) {
+    if (message.imageMessage) text = "Photo";
+    else if (message.videoMessage) text = "Video";
+    else if (message.audioMessage) text = "Voice message";
+    else if (message.documentMessage) text = message.documentMessage.fileName || "Document";
+  }
+  if (typeof text === "string" && text.trim()) {
+    return isViewOnce ? `👁️ View Once: ${text.trim()}` : text.trim();
+  }
+  return isViewOnce ? "👁️ View Once Message" : "";
 }
 function webhookMessageId(data, key) {
   return String(key?.id || data?.keyId || data?.id || data?.messageId || data?.message?.id || "");
