@@ -622,7 +622,7 @@ function extractOpenAiContent(data) {
 }
 
 app.post(
-  ["/api/media/transcribe", "/v1/audio/transcriptions"],
+  "/api/media/transcribe", // <-- Cleaned up: Only your custom gateway endpoint
   requireEnrollment,
   requireMediaRateLimit,
   async (req, res) => {
@@ -686,6 +686,7 @@ app.post(
           const headers = { accept: "application/json" };
           if (POLLINATIONS_API_KEY) headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
 
+          // This is the actual Pollinations service endpoint being called
           const response = await globalThis.fetch(`${POLLINATIONS_BASE_URL}/v1/audio/transcriptions`, {
             method: "POST",
             headers,
