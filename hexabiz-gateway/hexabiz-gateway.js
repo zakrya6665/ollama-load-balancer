@@ -32,25 +32,24 @@ for (const file of [".env", path.join(process.cwd(), ".env")]) {
 }
 
 // HexaSynq Gateway — Node.js 20+, ESM
-// Required dependencies: express, helmet, node-fetch, firebase-admin
-
 const PORT = Number.parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 const EVOLUTION_SERVER_URL = (process.env.EVOLUTION_SERVER_URL || "http://whatsapp_api:8080").replace(/\/+$/, "");
 const EVOLUTION_GLOBAL_KEY = process.env.EVOLUTION_GLOBAL_KEY || process.env.EVOLUTION_API_KEY || "";
-const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://ollama:11434").replace(/\/+$/, "");
+
+// Mapped to support your custom environment variable names
+const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_RUNNERS || "http://ollama:11434").replace(/\/+$/, "");
 const OLLAMA_DEFAULT_MODEL = process.env.OLLAMA_DEFAULT_MODEL || "synq:latest";
 const POLLINATIONS_BASE_URL = (process.env.POLLINATIONS_BASE_URL || "https://gen.pollinations.ai").replace(/\/+$/, "");
 const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "";
-const POLLINATIONS_MODEL = process.env.POLLINATIONS_MODEL || "openai/gpt-5.4-nano";
-// Media-specific Pollinations model names (configurable without code changes)
-const POLLINATIONS_AUDIO_MODEL = process.env.POLLINATIONS_AUDIO_MODEL || "microsoft/mai-transcribe-2";
+const POLLINATIONS_MODEL = process.env.POLLINATIONS_MODEL || process.env.FALLBACK_MODEL || "openai/gpt-5.4-nano";
+const POLLINATIONS_AUDIO_MODEL = process.env.POLLINATIONS_AUDIO_MODEL || process.env.POLLINATIONS_AUDIO_MODE || "microsoft/mai-transcribe-2";
 const POLLINATIONS_IMAGE_MODEL = process.env.POLLINATIONS_IMAGE_MODEL || "openai";
-// Maximum decoded media bytes accepted by the media endpoints.
+
 const MAX_MEDIA_DECODED_BYTES = positiveInt(process.env.MAX_MEDIA_DECODED_BYTES, 8 * 1_048_576);
-// Per-IP rate limit for media endpoints (requests per window).
-const MEDIA_RATE_LIMIT_WINDOW_MS = positiveInt(process.env.MEDIA_RATE_LIMIT_WINDOW_MS, 60_000);
-const MEDIA_RATE_LIMIT_MAX = positiveInt(process.env.MEDIA_RATE_LIMIT_MAX, 20);
+const MEDIA_RATE_LIMIT_WINDOW_MS = positiveInt(process.env.MEDIA_RATE_LIMIT_WINDOW_MS || process.env.RATE_LIMIT_WINDOW_MS, 60_000);
+const MEDIA_RATE_LIMIT_MAX = positiveInt(process.env.MEDIA_RATE_LIMIT_MAX || process.env.MAX_REQUESTS_PER_WINDOW, 20);
+
 const ENROLLMENT_KEY = process.env.ENROLLMENT_KEY || process.env.APP_ENROLLMENT_KEY || "";
 const WEBHOOK_SECRET =
   process.env.WEBHOOK_SECRET ||
@@ -72,15 +71,17 @@ const PLAY_INTEGRITY_VERIFIER_KEY = process.env.PLAY_INTEGRITY_VERIFIER_KEY || "
 const SERVICE_ACCOUNT_PATH = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "/run/secrets/serviceAccountKey.json";
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const MAPPINGS_FILE_PATH = process.env.MAPPINGS_FILE_PATH || path.join(DATA_DIR, "gateway_mappings.json");
-const REQUEST_TIMEOUT_MS = positiveInt(process.env.REQUEST_TIMEOUT_MS, 15_000);
-const AI_TIMEOUT_MS = positiveInt(process.env.AI_TIMEOUT_MS, 45_000);
+
+// Mapped to support your custom environment variable names
+const REQUEST_TIMEOUT_MS = positiveInt(process.env.REQUEST_TIMEOUT_MS || process.env.OUTBOUND_TIMEOUT_MS, 15_000);
+const AI_TIMEOUT_MS = positiveInt(process.env.AI_TIMEOUT_MS || process.env.OLLAMA_TIMEOUT_MS, 45_000);
 const MAX_BODY_BYTES = positiveInt(process.env.MAX_BODY_BYTES, 12 * 1_048_576);
-const MAX_CLOCK_SKEW_MS = positiveInt(process.env.MAX_CLOCK_SKEW_MS, 5 * 60_000);
+const MAX_CLOCK_SKEW_MS = positiveInt(process.env.MAX_CLOCK_SKEW_MS, (positiveInt(process.env.HMAC_MAX_SKEW_SECONDS, 60)) * 1000);
 const NONCE_TTL_MS = positiveInt(process.env.NONCE_TTL_MS, 10 * 60_000);
 const MAX_NONCES = positiveInt(process.env.MAX_NONCES, 20_000);
 const MAX_AI_CONCURRENCY = positiveInt(process.env.MAX_AI_CONCURRENCY, 4);
-const MAX_AI_QUEUE = positiveInt(process.env.MAX_AI_QUEUE, 30);
-const MAX_PROMPT_CHARS = positiveInt(process.env.MAX_PROMPT_CHARS, 20_000);
+const MAX_AI_QUEUE = positiveInt(process.env.MAX_AI_QUEUE || process.env.MAX_QUEUE_SIZE, 30);
+const MAX_PROMPT_CHARS = positiveInt(process.env.MAX_PROMPT_CHARS || process.env.MAX_PROMPT_LENGTH, 20_000);
 
 // AI Provider Configuration
 const AI_PROVIDER_RAW = (process.env.AI_PROVIDER || "HEXABIZ").trim().toUpperCase();
@@ -134,7 +135,6 @@ app.disable("x-powered-by");
 app.set("trust proxy", process.env.TRUST_PROXY === "true" ? 1 : false);
 app.use(helmet({ contentSecurityPolicy: false }));
 
-// Capture exact raw JSON bytes for HMAC verification. Do not re-serialize req.body for signatures.
 app.use(express.json({
   limit: MAX_BODY_BYTES,
   verify(req, _res, buffer) {
@@ -557,10 +557,6 @@ async function generateChatReply(messages) {
   }
 }
 
-// ============================================================================
-// Media endpoint helpers
-// ============================================================================
-
 function requireMediaRateLimit(req, res, next) {
   const ip = req.ip || req.socket?.remoteAddress || "unknown";
   if (!checkMediaRateLimit(ip)) {
@@ -624,10 +620,6 @@ function extractOpenAiContent(data) {
     return null;
   }
 }
-
-// ============================================================================
-// POST /api/media/transcribe & /v1/audio/transcriptions
-// ============================================================================
 
 app.post(
   ["/api/media/transcribe", "/v1/audio/transcriptions"],
@@ -742,10 +734,6 @@ app.post(
     }
   }
 );
-
-// ============================================================================
-// POST /api/media/analyse
-// ============================================================================
 
 app.post("/api/media/analyse", requireEnrollment, requireMediaRateLimit, async (req, res) => {
   const decoded = decodeBase64Field(res, req.body?.imageBase64, "imageBase64");
@@ -1261,6 +1249,11 @@ app.use((error, _req, res, _next) => {
 });
 
 await loadStore();
+
+// Explicit startup logs to verify environment variable resolution
+console.log(`[CONFIG] AI Provider resolved to: ${AI_PROVIDER} (Primary: ${AI_PROVIDER === "POLLINATIONS" ? "Pollinations" : "Ollama"})`);
+console.log(`[CONFIG] Ollama Model: ${OLLAMA_DEFAULT_MODEL}, Pollinations Model: ${POLLINATIONS_MODEL}`);
+
 const server = app.listen(PORT, HOST, () => {
   console.log(`HexaSynq Gateway listening on ${HOST}:${PORT}`);
 });
