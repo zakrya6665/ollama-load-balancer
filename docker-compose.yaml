@@ -31,7 +31,7 @@ services:
       EVOLUTION_SERVER_URL: "http://whatsapp_api:8080"
       EVOLUTION_GLOBAL_KEY: "${EVOLUTION_GLOBAL_KEY}"
       APP_ENROLLMENT_KEY: "${APP_ENROLLMENT_KEY}"
-      AI_PROVIDER: "ollama"
+      AI_PROVIDER: "POLLINATIONS"
       FALLBACK_MODEL: "openai/gpt-5.4-nano"
       POLLINATIONS_BASE_URL: "https://gen.pollinations.ai"
       POLLINATIONS_API_KEY: "${POLLINATIONS_API_KEY}"
