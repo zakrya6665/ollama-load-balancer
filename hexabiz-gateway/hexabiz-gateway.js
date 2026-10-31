@@ -331,7 +331,7 @@ async function logoutEvolutionInstance(instanceName) {
   try {
     return await evolutionRequest(`/instance/logout/${encodeURIComponent(instanceName)}`, { method: "DELETE" });
   } catch (error) {
-    process.stderr.write(`[LOGOUT] Evolution logout failed for ${instanceName}: ${error?.message}\n`);
+    console.error(`[LOGOUT] Evolution logout failed for ${instanceName}: ${error?.message}`);
     return null;
   }
 }
@@ -465,7 +465,7 @@ async function ollamaChat(messages) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
   const startTime = Date.now();
-  process.stdout.write(`[AI:OLLAMA] Requesting chat. Model: ${OLLAMA_DEFAULT_MODEL}\n`);
+  console.log(`[AI:OLLAMA] Requesting chat. Model: ${OLLAMA_DEFAULT_MODEL}`);
   try {
     const ollamaMessages = messages.filter((m) => m.role !== "system");
     const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
@@ -478,7 +478,7 @@ async function ollamaChat(messages) {
     if (!response.ok) throw new Error(`Ollama returned HTTP ${response.status}`);
     const content = data?.message?.content;
     if (typeof content !== "string" || !content.trim()) throw new Error("Ollama returned an empty response");
-    process.stdout.write(`[AI:OLLAMA] Success. Duration: ${Date.now() - startTime}ms\n`);
+    console.log(`[AI:OLLAMA] Success. Duration: ${Date.now() - startTime}ms`);
     return { content, model: data?.model || OLLAMA_DEFAULT_MODEL, provider: "ollama" };
   } finally {
     clearTimeout(timeout);
@@ -489,7 +489,7 @@ async function pollinationsChat(messages) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
   const startTime = Date.now();
-  process.stdout.write(`[AI:POLLINATIONS] Requesting chat. Model: ${POLLINATIONS_MODEL}\n`);
+  console.log(`[AI:POLLINATIONS] Requesting chat. Model: ${POLLINATIONS_MODEL}`);
   try {
     const headers = { "content-type": "application/json", accept: "application/json" };
     if (POLLINATIONS_API_KEY) headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
@@ -518,7 +518,7 @@ async function pollinationsChat(messages) {
     if (typeof content !== "string" || !content.trim()) {
       throw new Error("Pollinations returned an empty response");
     }
-    process.stdout.write(`[AI:POLLINATIONS] Success. Duration: ${Date.now() - startTime}ms\n`);
+    console.log(`[AI:POLLINATIONS] Success. Duration: ${Date.now() - startTime}ms`);
     return { content, model: data?.model || POLLINATIONS_MODEL, provider: "pollinations" };
   } finally {
     clearTimeout(timeout);
@@ -531,22 +531,22 @@ async function generateChatReply(messages) {
   const providers = { ollama: ollamaChat, pollinations: pollinationsChat };
 
   const startTime = Date.now();
-  process.stdout.write(`[AI:CHAT] Starting text generation. Primary: ${primaryProvider}, Messages count: ${messages.length}\n`);
+  console.log(`[AI:CHAT] Starting text generation. Primary: ${primaryProvider}, Messages count: ${messages.length}`);
 
   try {
     const result = await providers[primaryProvider](messages);
     const duration = Date.now() - startTime;
-    process.stdout.write(`[AI:CHAT] Success. Provider: ${result.provider}, Model: ${result.model}, Duration: ${duration}ms\n`);
+    console.log(`[AI:CHAT] Success. Provider: ${result.provider}, Model: ${result.model}, Duration: ${duration}ms`);
     return { ...result, fallbackUsed: false };
   } catch (primaryError) {
-    process.stderr.write(`[AI:FALLBACK] Primary provider ${primaryProvider} failed. Attempting ${fallbackProvider}. Reason: ${primaryError?.message || "unknown error"}\n`);
+    console.error(`[AI:FALLBACK] Primary provider ${primaryProvider} failed. Attempting ${fallbackProvider}. Reason: ${primaryError?.message || "unknown error"}`);
     try {
       const result = await providers[fallbackProvider](messages);
       const duration = Date.now() - startTime;
-      process.stdout.write(`[AI:CHAT] Success via fallback. Provider: ${result.provider}, Model: ${result.model}, Duration: ${duration}ms\n`);
+      console.log(`[AI:CHAT] Success via fallback. Provider: ${result.provider}, Model: ${result.model}, Duration: ${duration}ms`);
       return { ...result, fallbackUsed: true };
     } catch (fallbackError) {
-      process.stderr.write(`[AI:ERROR] Both providers failed. Primary=${primaryProvider}, Fallback=${fallbackProvider}\n`);
+      console.error(`[AI:ERROR] Both providers failed. Primary=${primaryProvider}, Fallback=${fallbackProvider}`);
       const error = new Error("AI providers are currently unavailable");
       error.cause = {
         primary: primaryError?.message || "unknown error",
@@ -665,7 +665,7 @@ app.post(
     }
 
     if (!POLLINATIONS_API_KEY) {
-      process.stderr.write("[AI:TRANSCRIBE] Warning: POLLINATIONS_API_KEY is not set; sending request without auth\n");
+      console.warn("[AI:TRANSCRIBE] Warning: POLLINATIONS_API_KEY is not set; sending request without auth");
     }
 
     const decoded = decodeBase64Field(res, req.body?.audio, "audio");
@@ -677,7 +677,7 @@ app.post(
 
     try {
       const startTime = Date.now();
-      process.stdout.write(`[AI:TRANSCRIBE] Starting transcription. Model: ${POLLINATIONS_AUDIO_MODEL}, Audio size: ${decoded.length} bytes\n`);
+      console.log(`[AI:TRANSCRIBE] Starting transcription. Model: ${POLLINATIONS_AUDIO_MODEL}, Audio size: ${decoded.length} bytes`);
       
       const transcript = await runAiTask(async () => {
         const form = new FormData();
@@ -728,11 +728,11 @@ app.post(
       });
 
       const duration = Date.now() - startTime;
-      process.stdout.write(`[AI:TRANSCRIBE] Success. Duration: ${duration}ms, Transcript length: ${transcript.length} chars\n`);
+      console.log(`[AI:TRANSCRIBE] Success. Duration: ${duration}ms, Transcript length: ${transcript.length} chars`);
       return res.json({ ok: true, transcript });
     } catch (error) {
       const status = Number.isInteger(error?.status) ? error.status : error?.name === "AbortError" ? 504 : 502;
-      process.stderr.write(`[AI:TRANSCRIBE] Failed with status ${status}. Reason: ${error instanceof Error ? error.message : "unknown"}\n`);
+      console.error(`[AI:TRANSCRIBE] Failed with status ${status}. Reason: ${error instanceof Error ? error.message : "unknown"}`);
       return jsonError(
         res, status,
         status === 429 ? "Transcription rate limit reached; retry shortly"
@@ -760,7 +760,7 @@ app.post("/api/media/analyse", requireEnrollment, requireMediaRateLimit, async (
 
   try {
     const startTime = Date.now();
-    process.stdout.write(`[AI:ANALYSE] Starting image analysis. Model: ${POLLINATIONS_IMAGE_MODEL}, Image size: ${decoded.length} bytes\n`);
+    console.log(`[AI:ANALYSE] Starting image analysis. Model: ${POLLINATIONS_IMAGE_MODEL}, Image size: ${decoded.length} bytes`);
     
     const result = await runAiTask(async () => {
       const body = {
@@ -817,11 +817,11 @@ Return only valid JSON. Do not add markdown fences or any other text outside the
     }
 
     const duration = Date.now() - startTime;
-    process.stdout.write(`[AI:ANALYSE] Success. Duration: ${duration}ms, Quality: ${quality}\n`);
+    console.log(`[AI:ANALYSE] Success. Duration: ${duration}ms, Quality: ${quality}`);
     return res.json({ ok: true, description, quality, appraisal });
   } catch (error) {
     const status = Number.isInteger(error?.status) ? error.status : 502;
-    process.stderr.write(`[AI:ANALYSE] Failed. Status: ${status}, Reason: ${error instanceof Error ? error.message : "unknown"}\n`);
+    console.error(`[AI:ANALYSE] Failed. Status: ${status}, Reason: ${error instanceof Error ? error.message : "unknown"}`);
     return jsonError(res, status, status === 429 ? "AI queue is full; retry shortly" : "Image analysis failed; please retry");
   }
 });
@@ -898,7 +898,7 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
         try { await configureEvolutionWebsocket(instanceName); }
         catch (error) {
           websocketConfigured = false;
-          process.stderr.write(`[WEBSOCKET] Configure failed for existing instance ${instanceName}: ${error?.status || error?.code || "unknown"}\n`);
+          console.error(`[WEBSOCKET] Configure failed for existing instance ${instanceName}: ${error?.status || error?.code || "unknown"}`);
         }
         let pairingCode = null;
         if (usePairingCode) {
@@ -906,7 +906,7 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
             const connect = await evolutionRequest(`/instance/connect/${encodeURIComponent(instanceName)}?number=${encodeURIComponent(phoneNumber)}`);
             pairingCode = connect?.pairingCode || connect?.pairing_code || connect?.code || null;
           } catch (connectError) {
-            process.stderr.write(`[PAIRING] Existing instance pairing code connect error: ${connectError?.message}\n`);
+            console.error(`[PAIRING] Existing instance pairing code connect error: ${connectError?.message}`);
           }
         }
         return { instanceName, deviceSecret: deriveDeviceSecret(deviceId), created: false, existing: true, pairingCode, websocketConfigured };
@@ -954,7 +954,7 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
                                 /already/i.test(createError?.data?.response?.message || createError?.message || "");
         const [checksumPrefix] = instanceName.split("_");
         if (isAlreadyExists && checksumPrefix === deviceId) {
-          process.stdout.write(`[INSTANCE] Auto-linking existing Evolution instance: ${instanceName}\n`);
+          console.log(`[INSTANCE] Auto-linking existing Evolution instance: ${instanceName}`);
         } else {
           throw createError;
         }
@@ -965,14 +965,14 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
           const connect = await evolutionRequest(`/instance/connect/${encodeURIComponent(instanceName)}?number=${encodeURIComponent(phoneNumber)}`);
           pairingCode = connect?.pairingCode || connect?.pairing_code || connect?.code || null;
         } catch (connectError) {
-          process.stderr.write(`[PAIRING] Pairing code connect error: ${connectError?.message}\n`);
+          console.error(`[PAIRING] Pairing code connect error: ${connectError?.message}`);
         }
       }
       let websocketConfigured = true;
       try { await configureEvolutionWebsocket(instanceName); }
       catch (error) {
         websocketConfigured = false;
-        process.stderr.write(`[WEBSOCKET] Configure failed for instance ${instanceName}: ${error?.status || error?.code || "unknown"}\n`);
+        console.error(`[WEBSOCKET] Configure failed for instance ${instanceName}: ${error?.status || error?.code || "unknown"}`);
       }
       const record = {
         deviceId,
@@ -1049,7 +1049,7 @@ app.post("/api/instance/release", verifyDeviceRequest, async (req, res) => {
     try {
       await deleteEvolutionInstance(record.instanceName);
     } catch (e) {
-      process.stderr.write(`[DELETE] Evolution delete failed for ${record.instanceName}: ${e?.message}\n`);
+      console.error(`[DELETE] Evolution delete failed for ${record.instanceName}: ${e?.message}`);
     }
 
     const oldRecord = { ...record };
@@ -1087,7 +1087,7 @@ app.post("/api/chat", verifyDeviceRequest, async (req, res) => {
     });
     return res.json({ ok: true, response: result.content, model: result.model, provider: result.provider });
   } catch (error) {
-    process.stderr.write(`[AI:CHAT] Request failed. Reason: ${error instanceof Error ? error.message : "unknown"}\n`);
+    console.error(`[AI:CHAT] Request failed. Reason: ${error instanceof Error ? error.message : "unknown"}`);
     return jsonError(res, 502, error instanceof Error ? error.message : "AI request failed");
   }
 });
@@ -1246,10 +1246,10 @@ app.post("/webhook/evolution", (req, res) => {
   setImmediate(() => {
     void sendPush(deviceId, mapped[1], payload)
       .then((result) => {
-        if (!result.sent) process.stderr.write(`[FCM] Push failed event=${mapped[1]} reason=${result.reason || "unknown"} instance=${instanceName}\n`);
+        if (!result.sent) console.error(`[FCM] Push failed event=${mapped[1]} reason=${result.reason || "unknown"} instance=${instanceName}`);
       })
       .catch((error) => {
-        process.stderr.write(`[FCM] Unexpected push error event=${mapped[1]} instance=${instanceName} reason=${error?.code || "unknown"}\n`);
+        console.error(`[FCM] Unexpected push error event=${mapped[1]} instance=${instanceName} reason=${error?.code || "unknown"}`);
       })
       .finally(() => webhookInFlight.delete(dedupeKey));
   });
@@ -1262,14 +1262,14 @@ app.use((error, _req, res, _next) => {
 
 await loadStore();
 const server = app.listen(PORT, HOST, () => {
-  process.stdout.write(`HexaSynq Gateway listening on ${HOST}:${PORT}\n`);
+  console.log(`HexaSynq Gateway listening on ${HOST}:${PORT}`);
 });
 
 let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  process.stdout.write(`Received ${signal}; shutting down\n`);
+  console.log(`Received ${signal}; shutting down`);
   server.close(async () => {
     try { await storeWriteChain; } catch { /* persistence failure already surfaced to caller */ }
     process.exit(0);
