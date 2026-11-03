@@ -1271,23 +1271,33 @@ function extractInstanceName(body) {
 function unwrapMessage(msg) {
   let current = msg;
   let isViewOnce = false;
-  while (current && typeof current === "object") {
-    if (current.viewOnceMessage || current.viewOnceMessageV2 || current.viewOnceMessageV2Extension) {
+  let iterations = 0;
+  while (current && typeof current === "object" && iterations < 10) {
+    iterations++;
+    const vo = current.viewOnceMessage || current.viewOnceMessageV2 || current.viewOnceMessageV2Extension;
+    if (vo) {
       isViewOnce = true;
+      current = vo.message || vo;
+      continue;
     }
-    const inner = current.viewOnceMessage?.message ||
-      current.viewOnceMessageV2?.message ||
-      current.viewOnceMessageV2Extension?.message ||
-      current.ephemeralMessage?.message ||
-      current.documentWithCaptionMessage?.message;
-    if (inner) {
-      current = inner;
+    const eph = current.ephemeralMessage;
+    if (eph) {
+      current = eph.message || eph;
+      continue;
+    }
+    const docWithCaption = current.documentWithCaptionMessage;
+    if (docWithCaption) {
+      current = docWithCaption.message || docWithCaption;
+      continue;
+    }
+    if (current.message && typeof current.message === "object" && Object.keys(current).length <= 2) {
+      current = current.message;
       continue;
     }
     break;
   }
   if (!isViewOnce && current && typeof current === "object") {
-    if (current.imageMessage?.viewOnce || current.videoMessage?.viewOnce || current.audioMessage?.viewOnce || current.documentMessage?.viewOnce || current.viewOnce) {
+    if (current.imageMessage?.viewOnce || current.videoMessage?.viewOnce || current.ptvMessage?.viewOnce || current.audioMessage?.viewOnce || current.documentMessage?.viewOnce || current.viewOnce) {
       isViewOnce = true;
     }
   }
@@ -1387,6 +1397,14 @@ app.post("/webhook/evolution", (req, res) => {
     timestamp: String(data.messageTimestamp || data.timestamp || body.date_time || body.timestamp || ""),
     messageText: extractMessageText(rawMsg),
     messageType: String(effectiveMsg && typeof effectiveMsg === "object" ? Object.keys(effectiveMsg).find((name) => name.endsWith("Message")) || "text" : "text"),
+    mediaType: String(
+      effectiveMsg?.imageMessage ? "image" :
+      effectiveMsg?.videoMessage || effectiveMsg?.ptvMessage ? "video" :
+      effectiveMsg?.audioMessage ? "audio" :
+      effectiveMsg?.documentMessage ? "document" :
+      effectiveMsg?.stickerMessage ? "sticker" :
+      (isViewOnce ? "image" : "")
+    ),
     hasMedia: String(Boolean(effectiveMsg && typeof effectiveMsg === "object" && Object.keys(effectiveMsg).some((name) => name.endsWith("Message") && name !== "extendedTextMessage"))),
     isViewOnce: String(isViewOnce),
     status: String(data.update?.status || data.status || ""),
