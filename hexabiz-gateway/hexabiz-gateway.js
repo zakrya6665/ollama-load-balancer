@@ -26,30 +26,34 @@ for (const file of [".env", path.join(process.cwd(), ".env")]) {
           }
           if (!process.env[key]) process.env[key] = val;
         }
+      
       }
     }
   } catch { /* ignore */ }
 }
 
 // HexaSynq Gateway — Node.js 20+, ESM
+// Required dependencies: express, helmet, node-fetch, firebase-admin
+
 const PORT = Number.parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 const EVOLUTION_SERVER_URL = (process.env.EVOLUTION_SERVER_URL || "http://whatsapp_api:8080").replace(/\/+$/, "");
 const EVOLUTION_GLOBAL_KEY = process.env.EVOLUTION_GLOBAL_KEY || process.env.EVOLUTION_API_KEY || "";
-
-// Mapped to support your custom environment variable names
-const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_RUNNERS || "http://ollama:11434").replace(/\/+$/, "");
+const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://ollama:11434").replace(/\/+$/, "");
 const OLLAMA_DEFAULT_MODEL = process.env.OLLAMA_DEFAULT_MODEL || "synq:latest";
 const POLLINATIONS_BASE_URL = (process.env.POLLINATIONS_BASE_URL || "https://gen.pollinations.ai").replace(/\/+$/, "");
 const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "";
-const POLLINATIONS_MODEL = process.env.POLLINATIONS_MODEL || process.env.FALLBACK_MODEL || "openai/gpt-5.4-nano";
-const POLLINATIONS_AUDIO_MODEL = process.env.POLLINATIONS_AUDIO_MODEL || process.env.POLLINATIONS_AUDIO_MODE || "microsoft/mai-transcribe-2";
+const POLLINATIONS_MODEL = process.env.POLLINATIONS_MODEL || "openai/gpt-5.4-nano";
+// Media-specific Pollinations model names (configurable without code changes)
+const POLLINATIONS_AUDIO_MODEL = process.env.POLLINATIONS_AUDIO_MODEL || "microsoft/mai-transcribe-2";
 const POLLINATIONS_IMAGE_MODEL = process.env.POLLINATIONS_IMAGE_MODEL || "openai";
-
+// Maximum decoded media bytes accepted by the media endpoints.
+// Base64 strings are ~33 % larger, so the JSON body limit must be raised accordingly.
+// Default: 8 MB decoded  →  ~10.7 MB base64 JSON body (MAX_BODY_BYTES covers the rest).
 const MAX_MEDIA_DECODED_BYTES = positiveInt(process.env.MAX_MEDIA_DECODED_BYTES, 8 * 1_048_576);
-const MEDIA_RATE_LIMIT_WINDOW_MS = positiveInt(process.env.MEDIA_RATE_LIMIT_WINDOW_MS || process.env.RATE_LIMIT_WINDOW_MS, 60_000);
-const MEDIA_RATE_LIMIT_MAX = positiveInt(process.env.MEDIA_RATE_LIMIT_MAX || process.env.MAX_REQUESTS_PER_WINDOW, 20);
-
+// Per-IP rate limit for media endpoints (requests per window).
+const MEDIA_RATE_LIMIT_WINDOW_MS = positiveInt(process.env.MEDIA_RATE_LIMIT_WINDOW_MS, 60_000);
+const MEDIA_RATE_LIMIT_MAX = positiveInt(process.env.MEDIA_RATE_LIMIT_MAX, 20);
 const ENROLLMENT_KEY = process.env.ENROLLMENT_KEY || process.env.APP_ENROLLMENT_KEY || "";
 const WEBHOOK_SECRET =
   process.env.WEBHOOK_SECRET ||
@@ -71,22 +75,20 @@ const PLAY_INTEGRITY_VERIFIER_KEY = process.env.PLAY_INTEGRITY_VERIFIER_KEY || "
 const SERVICE_ACCOUNT_PATH = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "/run/secrets/serviceAccountKey.json";
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const MAPPINGS_FILE_PATH = process.env.MAPPINGS_FILE_PATH || path.join(DATA_DIR, "gateway_mappings.json");
-
-// Mapped to support your custom environment variable names
-const REQUEST_TIMEOUT_MS = positiveInt(process.env.REQUEST_TIMEOUT_MS || process.env.OUTBOUND_TIMEOUT_MS, 15_000);
-const AI_TIMEOUT_MS = positiveInt(process.env.AI_TIMEOUT_MS || process.env.OLLAMA_TIMEOUT_MS, 45_000);
+const REQUEST_TIMEOUT_MS = positiveInt(process.env.REQUEST_TIMEOUT_MS, 15_000);
+const AI_TIMEOUT_MS = positiveInt(process.env.AI_TIMEOUT_MS, 45_000);
 const MAX_BODY_BYTES = positiveInt(process.env.MAX_BODY_BYTES, 12 * 1_048_576);
-const MAX_CLOCK_SKEW_MS = positiveInt(process.env.MAX_CLOCK_SKEW_MS, (positiveInt(process.env.HMAC_MAX_SKEW_SECONDS, 60)) * 1000);
+const MAX_CLOCK_SKEW_MS = positiveInt(process.env.MAX_CLOCK_SKEW_MS, 5 * 60_000);
 const NONCE_TTL_MS = positiveInt(process.env.NONCE_TTL_MS, 10 * 60_000);
 const MAX_NONCES = positiveInt(process.env.MAX_NONCES, 20_000);
 const MAX_AI_CONCURRENCY = positiveInt(process.env.MAX_AI_CONCURRENCY, 4);
-const MAX_AI_QUEUE = positiveInt(process.env.MAX_AI_QUEUE || process.env.MAX_QUEUE_SIZE, 30);
-const MAX_PROMPT_CHARS = positiveInt(process.env.MAX_PROMPT_CHARS || process.env.MAX_PROMPT_LENGTH, 20_000);
+const MAX_AI_QUEUE = positiveInt(process.env.MAX_AI_QUEUE, 30);
+const MAX_PROMPT_CHARS = positiveInt(process.env.MAX_PROMPT_CHARS, 20_000);
 
-// AI Provider Configuration
+// AI Provider Configuration: supports POLLINATIONS (or POLLINATION) and HEXABIZ (or OLLAMA)
 const AI_PROVIDER_RAW = (process.env.AI_PROVIDER || "HEXABIZ").trim().toUpperCase();
-const AI_PROVIDER = ["POLLINATIONS", "HEXABIZ"].includes(AI_PROVIDER_RAW)
-  ? AI_PROVIDER_RAW
+const AI_PROVIDER = (AI_PROVIDER_RAW === "POLLINATIONS" || AI_PROVIDER_RAW === "POLLINATION")
+  ? "POLLINATIONS"
   : "HEXABIZ";
 const POLLINATIONS_MAX_COMPLETION_TOKENS = positiveInt(
   process.env.POLLINATIONS_MAX_COMPLETION_TOKENS,
@@ -135,6 +137,7 @@ app.disable("x-powered-by");
 app.set("trust proxy", process.env.TRUST_PROXY === "true" ? 1 : false);
 app.use(helmet({ contentSecurityPolicy: false }));
 
+// Capture exact raw JSON bytes for HMAC verification. Do not re-serialize req.body for signatures.
 app.use(express.json({
   limit: MAX_BODY_BYTES,
   verify(req, _res, buffer) {
@@ -161,6 +164,7 @@ try {
   }
 } catch (error) {
   firebaseStatus = `unavailable: ${error instanceof Error ? error.message : "initialization failed"}`;
+  // Gateway remains available; FCM sends will return an explicit service-unavailable error.
 }
 
 const emptyStore = () => ({ version: 1, devices: {}, instances: {} });
@@ -174,8 +178,14 @@ const webhookInFlight = new Set();
 let aiActive = 0;
 const aiQueue = [];
 
+// Per-IP sliding-window rate limit map for media endpoints.
+// Key: IP address string. Value: { count, windowStart }.
 const mediaRateLimitMap = new Map();
 
+/**
+ * Checks and updates the per-IP rate limit for media endpoints.
+ * Returns true if the request is allowed, false if the limit is exceeded.
+ */
 function checkMediaRateLimit(ip) {
   const now = Date.now();
   let entry = mediaRateLimitMap.get(ip);
@@ -184,6 +194,7 @@ function checkMediaRateLimit(ip) {
   }
   entry.count += 1;
   mediaRateLimitMap.set(ip, entry);
+  // Periodically evict stale entries so the map does not grow unbounded.
   if (mediaRateLimitMap.size > 10_000) {
     for (const [key, value] of mediaRateLimitMap) {
       if ((now - value.windowStart) >= MEDIA_RATE_LIMIT_WINDOW_MS) mediaRateLimitMap.delete(key);
@@ -206,6 +217,7 @@ async function loadStore() {
     store = emptyStore();
     await persistStore();
   }
+  // Reconcile reverse mappings and discard malformed records without guessing ownership.
   const instances = {};
   for (const [deviceId, record] of Object.entries(store.devices)) {
     if (!record || typeof record !== "object" || typeof record.instanceName !== "string" || !record.instanceName) {
@@ -214,6 +226,7 @@ async function loadStore() {
     }
     const existing = instances[record.instanceName];
     if (existing && existing !== deviceId) {
+      // Ambiguous ownership is unsafe. Keep neither mapping; operator can reconcile manually.
       delete store.devices[existing];
       delete store.devices[deviceId];
       delete instances[record.instanceName];
@@ -226,6 +239,8 @@ async function loadStore() {
   await persistStore();
 }
 async function persistStore() {
+  // Capture a stable snapshot at call time. Recover the queue after a prior write
+  // failure so one disk error does not permanently poison every future save.
   const snapshot = JSON.stringify(store, null, 2);
   const write = storeWriteChain.catch(() => undefined).then(async () => {
     await fs.mkdir(path.dirname(MAPPINGS_FILE_PATH), { recursive: true });
@@ -291,6 +306,8 @@ function verifyDeviceRequest(req, res, next) {
   const rawBody = typeof req.rawBody === "string" ? req.rawBody : "";
   const expected = crypto.createHmac("sha256", secret).update(`${timestampText}.${nonce}.${rawBody}`).digest("hex");
   if (!timingSafeHexEqual(signature, expected)) return jsonError(res, 401, "Invalid request signature");
+  // Only consume a nonce after authenticating the signature; otherwise anyone who
+  // guesses a device ID could burn arbitrary nonce values for that device.
   if (!rememberOnce(nonceCache, nonceKey, NONCE_TTL_MS, MAX_NONCES)) return jsonError(res, 401, "Request nonce already used");
   req.deviceId = deviceId;
   req.deviceRecord = getDeviceRecord(deviceId);
@@ -331,7 +348,7 @@ async function logoutEvolutionInstance(instanceName) {
   try {
     return await evolutionRequest(`/instance/logout/${encodeURIComponent(instanceName)}`, { method: "DELETE" });
   } catch (error) {
-    console.error(`[LOGOUT] Evolution logout failed for ${instanceName}: ${error?.message}`);
+    process.stderr.write(`[LOGOUT] Evolution logout failed for ${instanceName}: ${error?.message}\n`);
     return null;
   }
 }
@@ -356,6 +373,8 @@ async function verifyPlayIntegrity(req, deviceId) {
     });
     if (!response.ok) return false;
     const result = await response.json();
+    // The verifier service must validate Google's token, package name, app recognition,
+    // licensing/device verdicts, freshness, and bind the verdict to this device/request.
     return result?.valid === true && result?.deviceId === deviceId;
   } catch {
     return false;
@@ -387,6 +406,8 @@ async function sendPush(deviceId, eventType, payload) {
     if (value === undefined || value === null) continue;
     data[key] = typeof value === "string" ? value : JSON.stringify(value);
   }
+  // Keep the message itself as the priority field. FCM data payloads have a strict
+  // size limit; long messages/media metadata are clipped, never allowed to block sync.
   if (typeof data.messageText === "string") data.messageText = truncateUtf8(data.messageText, 1_500);
   let encoded = JSON.stringify(data);
   while (Buffer.byteLength(encoded, "utf8") > 3_500) {
@@ -440,7 +461,9 @@ function pumpAiQueue() {
 function chatMessagesFromBody(body) {
   if (Array.isArray(body?.messages)) {
     if (body.messages.length === 0) return null;
+
     const messages = [];
+
     for (const item of body.messages) {
       if (
         !item ||
@@ -451,22 +474,29 @@ function chatMessagesFromBody(body) {
       ) {
         return null;
       }
-      messages.push({ role: item.role, content: item.content });
+
+      messages.push({
+        role: item.role,
+        content: item.content,
+      });
     }
+
     return messages;
   }
+
   if (typeof body?.prompt === "string" && body.prompt.trim()) {
     return [{ role: "user", content: body.prompt }];
   }
+
   return null;
 }
-
 async function ollamaChat(messages) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
-  const startTime = Date.now();
-  console.log(`[AI:OLLAMA] Requesting chat. Model: ${OLLAMA_DEFAULT_MODEL}`);
   try {
+    // The Ollama model has instructions baked in via a Modelfile system prompt.
+    // Strip any system message from the app before forwarding to avoid duplication
+    // or conflicts with the model's built-in behaviour.
     const ollamaMessages = messages.filter((m) => m.role !== "system");
     const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
       method: "POST",
@@ -478,21 +508,24 @@ async function ollamaChat(messages) {
     if (!response.ok) throw new Error(`Ollama returned HTTP ${response.status}`);
     const content = data?.message?.content;
     if (typeof content !== "string" || !content.trim()) throw new Error("Ollama returned an empty response");
-    console.log(`[AI:OLLAMA] Success. Duration: ${Date.now() - startTime}ms`);
     return { content, model: data?.model || OLLAMA_DEFAULT_MODEL, provider: "ollama" };
-  } finally {
-    clearTimeout(timeout);
-  }
+  } finally { clearTimeout(timeout); }
 }
 
 async function pollinationsChat(messages) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
-  const startTime = Date.now();
-  console.log(`[AI:POLLINATIONS] Requesting chat. Model: ${POLLINATIONS_MODEL}`);
+
   try {
-    const headers = { "content-type": "application/json", accept: "application/json" };
-    if (POLLINATIONS_API_KEY) headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
+    const headers = {
+      "content-type": "application/json",
+      accept: "application/json",
+    };
+
+    if (POLLINATIONS_API_KEY) {
+      headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
+    }
+
     const requestBody = {
       model: POLLINATIONS_MODEL,
       messages,
@@ -502,69 +535,116 @@ async function pollinationsChat(messages) {
       reasoning_effort: "none",
       temperature: 0,
     };
-    const response = await fetch(`${POLLINATIONS_BASE_URL}/v1/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(requestBody),
-      signal: controller.signal,
-    });
+
+    const response = await fetch(
+      `${POLLINATIONS_BASE_URL}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      }
+    );
+
     const data = await response.json().catch(() => ({}));
+
     if (!response.ok) {
-      const error = new Error(`Pollinations returned HTTP ${response.status}`);
+      const error = new Error(
+        `Pollinations returned HTTP ${response.status}`
+      );
       error.status = response.status;
       throw error;
     }
+
     const content = data?.choices?.[0]?.message?.content;
+
     if (typeof content !== "string" || !content.trim()) {
       throw new Error("Pollinations returned an empty response");
     }
-    console.log(`[AI:POLLINATIONS] Success. Duration: ${Date.now() - startTime}ms`);
-    return { content, model: data?.model || POLLINATIONS_MODEL, provider: "pollinations" };
+
+    return {
+      content,
+      model: data?.model || POLLINATIONS_MODEL,
+      provider: "pollinations",
+    };
   } finally {
     clearTimeout(timeout);
   }
 }
 
 async function generateChatReply(messages) {
-  const primaryProvider = AI_PROVIDER === "POLLINATIONS" ? "pollinations" : "ollama";
-  const fallbackProvider = AI_PROVIDER === "POLLINATIONS" ? "ollama" : "pollinations";
-  const providers = { ollama: ollamaChat, pollinations: pollinationsChat };
+  const primaryProvider =
+    AI_PROVIDER === "POLLINATIONS" ? "pollinations" : "ollama";
 
-  const startTime = Date.now();
-  console.log(`[AI:CHAT] Starting text generation. Primary: ${primaryProvider}, Messages count: ${messages.length}`);
+  const fallbackProvider =
+    AI_PROVIDER === "POLLINATIONS" ? "ollama" : "pollinations";
+
+  const providers = {
+    ollama: ollamaChat,
+    pollinations: pollinationsChat,
+  };
 
   try {
     const result = await providers[primaryProvider](messages);
-    const duration = Date.now() - startTime;
-    console.log(`[AI:CHAT] Success. Provider: ${result.provider}, Model: ${result.model}, Duration: ${duration}ms`);
-    return { ...result, fallbackUsed: false };
+
+    return {
+      ...result,
+      fallbackUsed: false,
+    };
   } catch (primaryError) {
-    console.error(`[AI:FALLBACK] Primary provider ${primaryProvider} failed. Attempting ${fallbackProvider}. Reason: ${primaryError?.message || "unknown error"}`);
+    process.stderr.write(
+      `[AI:FALLBACK] Primary provider ${primaryProvider} failed. ` +
+      `Attempting ${fallbackProvider}. Reason: ${
+        primaryError?.message || "unknown error"
+      }\n`
+    );
+
     try {
       const result = await providers[fallbackProvider](messages);
-      const duration = Date.now() - startTime;
-      console.log(`[AI:CHAT] Success via fallback. Provider: ${result.provider}, Model: ${result.model}, Duration: ${duration}ms`);
-      return { ...result, fallbackUsed: true };
+
+      return {
+        ...result,
+        fallbackUsed: true,
+      };
     } catch (fallbackError) {
-      console.error(`[AI:ERROR] Both providers failed. Primary=${primaryProvider}, Fallback=${fallbackProvider}`);
+      process.stderr.write(
+        `[AI:ERROR] Both providers failed. Primary=${primaryProvider}, ` +
+        `Fallback=${fallbackProvider}\n`
+      );
+
       const error = new Error("AI providers are currently unavailable");
+
       error.cause = {
         primary: primaryError?.message || "unknown error",
         fallback: fallbackError?.message || "unknown error",
       };
+
       throw error;
     }
   }
 }
 
+// ============================================================================
+// Media endpoint helpers
+// ============================================================================
+
+/**
+ * Middleware: per-IP rate limit for the two media endpoints.
+ * Uses the leftmost forwarded IP when trust proxy is enabled.
+ */
 function requireMediaRateLimit(req, res, next) {
   const ip = req.ip || req.socket?.remoteAddress || "unknown";
   if (!checkMediaRateLimit(ip)) {
     return jsonError(res, 429, "Media rate limit exceeded; retry after a short wait");
   }
-  return next;
+  return next();
 }
 
+/**
+ * Validates and decodes a base64 string field from req.body.
+ * Returns a Buffer on success or calls jsonError and returns null.
+ * The fieldName is used only for the error message, never echoed as-is.
+ */
 function decodeBase64Field(res, value, fieldName) {
   if (typeof value !== "string" || value.length === 0) {
     jsonError(res, 400, `${fieldName} must be a non-empty base64 string`);
@@ -586,6 +666,10 @@ function decodeBase64Field(res, value, fieldName) {
   return decoded;
 }
 
+/**
+ * POSTs a JSON body to a Pollinations text endpoint and returns the parsed response.
+ * Returns { ok: true, data } or throws an Error with a safe message.
+ */
 async function pollinationsMediaRequest(endpoint, bodyObj) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
@@ -612,6 +696,10 @@ async function pollinationsMediaRequest(endpoint, bodyObj) {
   }
 }
 
+/**
+ * Extracts the assistant content string from an OpenAI-compatible
+ * chat-completions response envelope.  Returns null on any parse failure.
+ */
 function extractOpenAiContent(data) {
   try {
     const content = data?.choices?.[0]?.message?.content;
@@ -621,12 +709,20 @@ function extractOpenAiContent(data) {
   }
 }
 
+// ============================================================================
+// POST /api/media/transcribe & /v1/audio/transcriptions
+// ============================================================================
+
 app.post(
-  "/api/media/transcribe", // <-- Cleaned up: Only your custom gateway endpoint
+  ["/api/media/transcribe", "/v1/audio/transcriptions"],
   requireEnrollment,
   requireMediaRateLimit,
   async (req, res) => {
-    const mimeType = typeof req.body?.mimeType === "string" ? req.body.mimeType.trim().toLowerCase() : "";
+    const mimeType =
+      typeof req.body?.mimeType === "string"
+        ? req.body.mimeType.trim().toLowerCase()
+        : "";
+
     const normalizedMime = mimeType.split(";")[0].trim();
 
     const AUDIO_FORMATS = {
@@ -641,15 +737,24 @@ app.post(
     };
 
     const audioFormat = AUDIO_FORMATS[normalizedMime];
+
     if (!audioFormat) {
-      return jsonError(res, 400, "Unsupported audio format. Use OGG, MP3, MP4/M4A, WAV, or WebM.");
+      return jsonError(
+        res,
+        400,
+        "Unsupported audio format. Use OGG, MP3, MP4/M4A, WAV, or WebM."
+      );
     }
 
     let language = typeof req.body?.language === "string" ? req.body.language.trim().toLowerCase() : "";
     if (!language) {
       const ownerPhone = String(
-        req.body?.ownerPhone || req.body?.phoneNumber || req.headers["x-phone-number"] ||
-        req.headers["x-owner-phone"] || req.headers["x-instance-name"] || ""
+        req.body?.ownerPhone ||
+        req.body?.phoneNumber ||
+        req.headers["x-phone-number"] ||
+        req.headers["x-owner-phone"] ||
+        req.headers["x-instance-name"] ||
+        ""
       ).replace(/\D/g, "");
       if (ownerPhone.startsWith("92")) {
         language = "ur";
@@ -657,7 +762,7 @@ app.post(
     }
 
     if (!POLLINATIONS_API_KEY) {
-      console.warn("[AI:TRANSCRIBE] Warning: POLLINATIONS_API_KEY is not set; sending request without auth");
+      process.stderr.write("[MEDIA:TRANSCRIBE] Warning: POLLINATIONS_API_KEY is not set; sending request without auth\n");
     }
 
     const decoded = decodeBase64Field(res, req.body?.audio, "audio");
@@ -668,79 +773,130 @@ app.post(
     }
 
     try {
-      const startTime = Date.now();
-      console.log(`[AI:TRANSCRIBE] Starting transcription. Model: ${POLLINATIONS_AUDIO_MODEL}, Audio size: ${decoded.length} bytes`);
-      
       const transcript = await runAiTask(async () => {
         const form = new FormData();
-        form.set("file", new Blob([decoded], { type: audioFormat.mime }), `recording.${audioFormat.extension}`);
+
+        form.set(
+          "file",
+          new Blob([decoded], { type: audioFormat.mime }),
+          `recording.${audioFormat.extension}`
+        );
+
         form.set("model", POLLINATIONS_AUDIO_MODEL);
         form.set("response_format", "json");
         form.set("temperature", "0");
-        if (language) form.set("language", language);
+        if (language) {
+          form.set("language", language);
+        }
 
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+        const timeout = setTimeout(
+          () => controller.abort(),
+          AI_TIMEOUT_MS
+        );
 
         try {
-          const headers = { accept: "application/json" };
-          if (POLLINATIONS_API_KEY) headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
+          // Use Node.js 20's native fetch for multipart FormData.
+          // Do not set Content-Type manually: fetch adds the boundary.
+          const headers = {
+            accept: "application/json",
+          };
+          if (POLLINATIONS_API_KEY) {
+            headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
+          }
 
-          // This is the actual Pollinations service endpoint being called
-          const response = await globalThis.fetch(`${POLLINATIONS_BASE_URL}/v1/audio/transcriptions`, {
-            method: "POST",
-            headers,
-            body: form,
-            signal: controller.signal,
-          });
+          const response = await globalThis.fetch(
+            `${POLLINATIONS_BASE_URL}/v1/audio/transcriptions`,
+            {
+              method: "POST",
+              headers,
+              body: form,
+              signal: controller.signal,
+            }
+          );
 
           const responseText = await response.text();
+
           let data;
-          try { data = responseText ? JSON.parse(responseText) : {}; } catch { data = { text: responseText }; }
+          try {
+            data = responseText ? JSON.parse(responseText) : {};
+          } catch {
+            data = { text: responseText };
+          }
 
           if (!response.ok) {
-            const error = new Error(`Pollinations transcription returned HTTP ${response.status}`);
-            error.status = response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status;
+            const error = new Error(
+              `Pollinations transcription returned HTTP ${response.status}`
+            );
+
+            error.status = response.status === 429
+              ? 429
+              : response.status >= 500
+                ? 502
+                : response.status;
+
             throw error;
           }
 
-          const text = typeof data?.text === "string" ? data.text.trim()
-            : typeof data?.transcript === "string" ? data.transcript.trim()
-            : typeof data === "string" ? data.trim()
-            : "";
+          const text =
+            typeof data?.text === "string"
+              ? data.text.trim()
+              : typeof data?.transcript === "string"
+                ? data.transcript.trim()
+                : typeof data === "string"
+                  ? data.trim()
+                  : "";
 
           if (!text) {
-            const error = new Error("Pollinations returned an empty transcription");
+            const error = new Error(
+              "Pollinations returned an empty transcription"
+            );
             error.status = 502;
             throw error;
           }
+
           return text;
         } finally {
           clearTimeout(timeout);
         }
       });
 
-      const duration = Date.now() - startTime;
-      console.log(`[AI:TRANSCRIBE] Success. Duration: ${duration}ms, Transcript length: ${transcript.length} chars`);
       return res.json({ ok: true, transcript });
     } catch (error) {
-      const status = Number.isInteger(error?.status) ? error.status : error?.name === "AbortError" ? 504 : 502;
-      console.error(`[AI:TRANSCRIBE] Failed with status ${status}. Reason: ${error instanceof Error ? error.message : "unknown"}`);
+      const status = Number.isInteger(error?.status)
+        ? error.status
+        : error?.name === "AbortError"
+          ? 504
+          : 502;
+
+      process.stderr.write(
+        `[MEDIA:TRANSCRIBE] Failed with status ${status}\n`
+      );
+
       return jsonError(
-        res, status,
-        status === 429 ? "Transcription rate limit reached; retry shortly"
-        : status === 504 ? "Transcription timed out; please retry"
-        : "Transcription failed; please retry"
+        res,
+        status,
+        status === 429
+          ? "Transcription rate limit reached; retry shortly"
+          : status === 504
+            ? "Transcription timed out; please retry"
+            : "Transcription failed; please retry"
       );
     }
   }
 );
 
+
+// ============================================================================
+// POST /api/media/analyse
+// ============================================================================
+
 app.post("/api/media/analyse", requireEnrollment, requireMediaRateLimit, async (req, res) => {
+  // Validate and size-check the base64 image payload.
   const decoded = decodeBase64Field(res, req.body?.imageBase64, "imageBase64");
   if (!decoded) return;
 
-  const imageBase64 = req.body.imageBase64;
+  const imageBase64 = req.body.imageBase64; // validated above
   const dataUri = `data:image/jpeg;base64,${imageBase64}`;
 
   if (aiQueue.length >= MAX_AI_QUEUE && aiActive >= MAX_AI_CONCURRENCY) {
@@ -748,9 +904,6 @@ app.post("/api/media/analyse", requireEnrollment, requireMediaRateLimit, async (
   }
 
   try {
-    const startTime = Date.now();
-    console.log(`[AI:ANALYSE] Starting image analysis. Model: ${POLLINATIONS_IMAGE_MODEL}, Image size: ${decoded.length} bytes`);
-    
     const result = await runAiTask(async () => {
       const body = {
         model: POLLINATIONS_IMAGE_MODEL,
@@ -768,7 +921,10 @@ app.post("/api/media/analyse", requireEnrollment, requireMediaRateLimit, async (
 }
 Return only valid JSON. Do not add markdown fences or any other text outside the JSON object.`,
               },
-              { type: "image_url", image_url: { url: dataUri, detail: "auto" } },
+              {
+                type: "image_url",
+                image_url: { url: dataUri, detail: "auto" },
+              },
             ],
           },
         ],
@@ -785,12 +941,18 @@ Return only valid JSON. Do not add markdown fences or any other text outside the
       return raw;
     });
 
+    // Parse and validate the structured image response.
+    // Malformed JSON from the model is handled gracefully.
     let description = "";
     let quality = "unknown";
     let appraisal = null;
 
     try {
-      const cleaned = result.replace(/^\`\`\`json\s*/i, "").replace(/^\`\`\`\s*/i, "").replace(/\`\`\`\s*$/, "").trim();
+      const cleaned = result
+        .replace(/^\`\`\`json\s*/i, "")
+        .replace(/^\`\`\`\s*/i, "")
+        .replace(/\`\`\`\s*$/, "")
+        .trim();
       const parsed = JSON.parse(cleaned);
       description = typeof parsed.description === "string" ? parsed.description.trim() : result.trim();
       quality = typeof parsed.quality === "string" && ["good", "average", "poor"].includes(parsed.quality.toLowerCase())
@@ -800,17 +962,16 @@ Return only valid JSON. Do not add markdown fences or any other text outside the
         ? parsed.appraisal.trim()
         : null;
     } catch {
+      // Model did not return valid JSON; surface the raw text as the description.
       description = result.trim();
       quality = "unknown";
       appraisal = null;
     }
 
-    const duration = Date.now() - startTime;
-    console.log(`[AI:ANALYSE] Success. Duration: ${duration}ms, Quality: ${quality}`);
     return res.json({ ok: true, description, quality, appraisal });
   } catch (error) {
     const status = Number.isInteger(error?.status) ? error.status : 502;
-    console.error(`[AI:ANALYSE] Failed. Status: ${status}, Reason: ${error instanceof Error ? error.message : "unknown"}`);
+    process.stderr.write(`[MEDIA:ANALYSE] Error: ${error instanceof Error ? error.message : "unknown"}\n`);
     return jsonError(res, status, status === 429 ? "AI queue is full; retry shortly" : "Image analysis failed; please retry");
   }
 });
@@ -855,6 +1016,7 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
       const instanceName = instanceNameForPhone(phoneNumber, deviceId);
       let existing = getDeviceRecord(deviceId);
 
+      // If no device record by deviceId directly, check if this instance was registered before
       if (!existing && store.instances[instanceName]) {
         existing = getDeviceRecord(store.instances[instanceName]);
       }
@@ -887,7 +1049,7 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
         try { await configureEvolutionWebsocket(instanceName); }
         catch (error) {
           websocketConfigured = false;
-          console.error(`[WEBSOCKET] Configure failed for existing instance ${instanceName}: ${error?.status || error?.code || "unknown"}`);
+          process.stderr.write(`[WEBSOCKET] Configure failed for existing instance ${instanceName}: ${error?.status || error?.code || "unknown"}\n`);
         }
         let pairingCode = null;
         if (usePairingCode) {
@@ -895,7 +1057,7 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
             const connect = await evolutionRequest(`/instance/connect/${encodeURIComponent(instanceName)}?number=${encodeURIComponent(phoneNumber)}`);
             pairingCode = connect?.pairingCode || connect?.pairing_code || connect?.code || null;
           } catch (connectError) {
-            console.error(`[PAIRING] Existing instance pairing code connect error: ${connectError?.message}`);
+            process.stderr.write(`[PAIRING] Existing instance pairing code connect error: ${connectError?.message}\n`);
           }
         }
         return { instanceName, deviceSecret: deriveDeviceSecret(deviceId), created: false, existing: true, pairingCode, websocketConfigured };
@@ -908,6 +1070,7 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
         throw error;
       }
 
+      // Do not delete on a failed create unless this request can prove it created the instance.
       let createdByThisRequest = false;
       let createdInstance = false;
       let pairingCode = null;
@@ -943,7 +1106,8 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
                                 /already/i.test(createError?.data?.response?.message || createError?.message || "");
         const [checksumPrefix] = instanceName.split("_");
         if (isAlreadyExists && checksumPrefix === deviceId) {
-          console.log(`[INSTANCE] Auto-linking existing Evolution instance: ${instanceName}`);
+          process.stdout.write(`[INSTANCE] Auto-linking existing Evolution instance: ${instanceName}\n`);
+          // Instance already exists in Evolution API for this checksum; link to it
         } else {
           throw createError;
         }
@@ -954,14 +1118,14 @@ app.post("/api/instance/create", requireEnrollment, async (req, res) => {
           const connect = await evolutionRequest(`/instance/connect/${encodeURIComponent(instanceName)}?number=${encodeURIComponent(phoneNumber)}`);
           pairingCode = connect?.pairingCode || connect?.pairing_code || connect?.code || null;
         } catch (connectError) {
-          console.error(`[PAIRING] Pairing code connect error: ${connectError?.message}`);
+          process.stderr.write(`[PAIRING] Pairing code connect error: ${connectError?.message}\n`);
         }
       }
       let websocketConfigured = true;
       try { await configureEvolutionWebsocket(instanceName); }
       catch (error) {
         websocketConfigured = false;
-        console.error(`[WEBSOCKET] Configure failed for instance ${instanceName}: ${error?.status || error?.code || "unknown"}`);
+        process.stderr.write(`[WEBSOCKET] Configure failed for instance ${instanceName}: ${error?.status || error?.code || "unknown"}\n`);
       }
       const record = {
         deviceId,
@@ -1005,6 +1169,7 @@ app.post("/api/device/fcm", verifyDeviceRequest, async (req, res) => {
     await persistStore();
     return res.json({ ok: true, registered: true, instanceName: record.instanceName });
   } catch {
+    // Keep in-memory state consistent with the last known durable state.
     record.fcmToken = previousToken;
     record.updatedAt = previousUpdatedAt;
     return jsonError(res, 500, "Could not persist FCM token");
@@ -1035,10 +1200,11 @@ app.post("/api/instance/release", verifyDeviceRequest, async (req, res) => {
   const isPermanent = req.body?.permanent === true || req.body?.mode === "permanent";
 
   if (isPermanent) {
+    // Permanent unlink: delete instance in Evolution API and remove gateway mapping
     try {
       await deleteEvolutionInstance(record.instanceName);
     } catch (e) {
-      console.error(`[DELETE] Evolution delete failed for ${record.instanceName}: ${e?.message}`);
+      process.stderr.write(`[DELETE] Evolution delete failed for ${record.instanceName}: ${e?.message}\n`);
     }
 
     const oldRecord = { ...record };
@@ -1053,6 +1219,7 @@ app.post("/api/instance/release", verifyDeviceRequest, async (req, res) => {
       return jsonError(res, 500, "Could not persist instance release");
     }
   } else {
+    // Temporary unlink: logout WhatsApp session in Evolution API, disconnect socket
     await logoutEvolutionInstance(record.instanceName);
     delete record.fcmToken;
     record.updatedAt = new Date().toISOString();
@@ -1076,7 +1243,6 @@ app.post("/api/chat", verifyDeviceRequest, async (req, res) => {
     });
     return res.json({ ok: true, response: result.content, model: result.model, provider: result.provider });
   } catch (error) {
-    console.error(`[AI:CHAT] Request failed. Reason: ${error instanceof Error ? error.message : "unknown"}`);
     return jsonError(res, 502, error instanceof Error ? error.message : "AI request failed");
   }
 });
@@ -1231,39 +1397,37 @@ app.post("/webhook/evolution", (req, res) => {
       : String(data.pushName || data.notifyName || data.name || "WhatsApp message").slice(0, 100),
   };
 
+  // Return to Evolution immediately. FCM is best-effort and never blocks the
+  // webhook response or the Android app's independent Evolution/WebSocket sync.
   res.status(200).json({ ok: true, accepted: true, notification: "scheduled" });
   setImmediate(() => {
     void sendPush(deviceId, mapped[1], payload)
       .then((result) => {
-        if (!result.sent) console.error(`[FCM] Push failed event=${mapped[1]} reason=${result.reason || "unknown"} instance=${instanceName}`);
+        if (!result.sent) process.stderr.write(`[FCM] Push failed event=${mapped[1]} reason=${result.reason || "unknown"} instance=${instanceName}\n`);
       })
       .catch((error) => {
-        console.error(`[FCM] Unexpected push error event=${mapped[1]} instance=${instanceName} reason=${error?.code || "unknown"}`);
+        process.stderr.write(`[FCM] Unexpected push error event=${mapped[1]} instance=${instanceName} reason=${error?.code || "unknown"}\n`);
       })
       .finally(() => webhookInFlight.delete(dedupeKey));
   });
 });
 
 app.use((error, _req, res, _next) => {
+  // Do not expose stack traces or upstream credentials to clients.
   const status = Number.isInteger(error?.status) ? error.status : 500;
   return jsonError(res, status, status >= 500 ? "Internal server error" : (error?.message || "Request failed"));
 });
 
 await loadStore();
-
-// Explicit startup logs to verify environment variable resolution
-console.log(`[CONFIG] AI Provider resolved to: ${AI_PROVIDER} (Primary: ${AI_PROVIDER === "POLLINATIONS" ? "Pollinations" : "Ollama"})`);
-console.log(`[CONFIG] Ollama Model: ${OLLAMA_DEFAULT_MODEL}, Pollinations Model: ${POLLINATIONS_MODEL}`);
-
 const server = app.listen(PORT, HOST, () => {
-  console.log(`HexaSynq Gateway listening on ${HOST}:${PORT}`);
+  process.stdout.write(`HexaSynq Gateway listening on ${HOST}:${PORT}\n`);
 });
 
 let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`Received ${signal}; shutting down`);
+  process.stdout.write(`Received ${signal}; shutting down\n`);
   server.close(async () => {
     try { await storeWriteChain; } catch { /* persistence failure already surfaced to caller */ }
     process.exit(0);
