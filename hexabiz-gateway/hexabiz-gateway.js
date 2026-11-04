@@ -92,6 +92,100 @@ const POLLINATIONS_MAX_COMPLETION_TOKENS = positiveInt(
   200
 );
 
+// Supabase Storage Configuration (Locally hosted Supabase Storage WA-Copilot)
+const SUPABASE_URL = (process.env.SUPABASE_URL || "https://datacore-qw8cvyeyjo.hexabizsolutions.cloud").replace(/\/+$/, "");
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || "";
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "WA-Copilot";
+
+function getSupabaseSubfolder(mediaType, mimeType = "") {
+  const normType = String(mediaType || "").toLowerCase();
+  const normMime = String(mimeType || "").toLowerCase();
+  if (normType === "image" || normMime.startsWith("image/")) return "image";
+  if (normType === "voice" || normType === "audio" || normMime.startsWith("audio/")) return "voice-notes";
+  if (normType === "video" || normMime.startsWith("video/")) return "videos";
+  return "docs";
+}
+
+function mimeTypeToExtension(mimeType, mediaType) {
+  const m = String(mimeType || "").toLowerCase();
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("png")) return "png";
+  if (m.includes("webp")) return "webp";
+  if (m.includes("ogg") || m.includes("opus")) return "ogg";
+  if (m.includes("mpeg") || m.includes("mp3")) return "mp3";
+  if (m.includes("mp4") || m.includes("m4a")) return "mp4";
+  if (m.includes("wav")) return "wav";
+  if (m.includes("pdf")) return "pdf";
+  if (m.includes("doc")) return "docx";
+  if (m.includes("txt")) return "txt";
+  const type = String(mediaType || "").toLowerCase();
+  if (type === "image") return "jpg";
+  if (type === "voice" || type === "audio") return "ogg";
+  if (type === "video") return "mp4";
+  return "bin";
+}
+
+async function uploadToSupabaseStorage(phoneNumber, mediaType, mimeType, fileBuffer, customFileName = "") {
+  if (!SUPABASE_SERVICE_ROLE_KEY) {
+    debugLog("SUPABASE", "Warning: SUPABASE_SERVICE_ROLE_KEY is not set; skipping upload.");
+    return { uploaded: false, path: null, signedUrl: null };
+  }
+
+  const normPhone = normalizePhone(phoneNumber) || "unassigned_owner";
+  const subfolder = getSupabaseSubfolder(mediaType, mimeType);
+  const ext = mimeTypeToExtension(mimeType, mediaType);
+  const safeName = customFileName
+    ? String(customFileName).replace(/[^a-zA-Z0-9_.-]/g, "_")
+    : `media_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${ext}`;
+
+  const objectPath = `${normPhone}/${subfolder}/${safeName}`;
+
+  try {
+    const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${SUPABASE_BUCKET}/${objectPath}`;
+    const uploadRes = await fetch(uploadUrl, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        "content-type": mimeType || "application/octet-stream",
+        "x-upsert": "true",
+      },
+      body: fileBuffer,
+    });
+
+    if (!uploadRes.ok) {
+      debugLog("SUPABASE_UPLOAD_FAIL", `Upload HTTP ${uploadRes.status}`);
+      return { uploaded: false, path: objectPath, signedUrl: null };
+    }
+
+    // Generate short-lived signed URL (300 seconds)
+    const signUrl = `${SUPABASE_URL}/storage/v1/object/sign/${SUPABASE_BUCKET}/${objectPath}`;
+    const signRes = await fetch(signUrl, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ expiresIn: 300 }),
+    });
+
+    let signedUrl = null;
+    if (signRes.ok) {
+      const signData = await signRes.json().catch(() => ({}));
+      const rawSigned = signData?.signedURL || signData?.signedUrl || signData?.url;
+      if (rawSigned) {
+        signedUrl = rawSigned.startsWith("http") ? rawSigned : `${SUPABASE_URL}${rawSigned}`;
+      }
+    }
+
+    // Metadata-only log: Never log phone numbers, keys, content, or signed URL
+    debugLog("SUPABASE_SUCCESS", `Uploaded object to bucket subfolder=${subfolder}`);
+    return { uploaded: true, path: objectPath, signedUrl };
+  } catch (error) {
+    debugLog("SUPABASE_ERROR", "Supabase storage error", { error: error?.message });
+    return { uploaded: false, path: objectPath, signedUrl: null };
+  }
+}
+
 // Debug Logging Configuration
 const ENABLE_LOGS_DEBUG = process.env.ENABLE_LOGS_DEBUG === "true";
 
@@ -939,6 +1033,120 @@ Return only valid JSON. Do not add markdown fences or any other text outside the
     return jsonError(res, status, status === 429 ? "AI queue is full; retry shortly" : "Image analysis failed; please retry");
   }
 });
+
+// ============================================================================
+// POST /api/media/process & /api/media/auto-process
+// ============================================================================
+
+app.post(
+  ["/api/media/process", "/api/media/auto-process"],
+  requireEnrollment,
+  requireMediaRateLimit,
+  async (req, res) => {
+    const rawMediaType = String(req.body?.mediaType || "").toLowerCase();
+    const mimeType = String(req.body?.mimeType || "application/octet-stream").trim().toLowerCase();
+    const ownerPhone = String(req.body?.ownerPhone || req.body?.phoneNumber || "").replace(/\D/g, "");
+    const fileName = req.body?.fileName || req.body?.filename;
+
+    const base64Content = req.body?.mediaBase64 || req.body?.audio || req.body?.imageBase64;
+    const decoded = decodeBase64Field(res, base64Content, "mediaBase64");
+    if (!decoded) return;
+
+    if (aiQueue.length >= MAX_AI_QUEUE && aiActive >= MAX_AI_CONCURRENCY) {
+      return jsonError(res, 429, "AI queue is full; retry shortly");
+    }
+
+    try {
+      // 1. Upload to Supabase Storage in WA-Copilot/{phone}/{subfolder}/
+      const storageResult = await uploadToSupabaseStorage(
+        ownerPhone,
+        rawMediaType,
+        mimeType,
+        decoded,
+        fileName
+      );
+
+      // 2. Perform AI Analysis
+      const isImage = rawMediaType === "image" || mimeType.startsWith("image/");
+      const isAudio = rawMediaType === "voice" || rawMediaType === "audio" || mimeType.startsWith("audio/");
+      const isVideo = rawMediaType === "video" || mimeType.startsWith("video/");
+
+      let rawAnalysis = "";
+      await runAiTask(async () => {
+        if (isImage) {
+          const imageUrl = storageResult.signedUrl || `data:image/jpeg;base64,${base64Content}`;
+          const body = {
+            model: POLLINATIONS_IMAGE_MODEL,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: "Analyze this image in 1-2 clear, informative sentences for a user assistant.",
+                  },
+                  { type: "image_url", image_url: { url: imageUrl, detail: "auto" } },
+                ],
+              },
+            ],
+            max_tokens: 300,
+          };
+          const data = await pollinationsMediaRequest("/openai", body);
+          rawAnalysis = extractOpenAiContent(data) || "Image received and stored.";
+        } else if (isAudio) {
+          const form = new FormData();
+          form.set("file", new Blob([decoded], { type: mimeType || "audio/ogg" }), `recording.ogg`);
+          form.set("model", POLLINATIONS_AUDIO_MODEL);
+          form.set("response_format", "json");
+          if (ownerPhone.startsWith("92")) form.set("language", "ur");
+
+          const headers = { accept: "application/json" };
+          if (POLLINATIONS_API_KEY) headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
+
+          const response = await globalThis.fetch(`${POLLINATIONS_BASE_URL}/v1/audio/transcriptions`, {
+            method: "POST",
+            headers,
+            body: form,
+          });
+          const resData = await response.json().catch(() => ({}));
+          rawAnalysis = (resData?.text || resData?.transcript || "Audio recorded.").trim();
+        } else if (isVideo) {
+          rawAnalysis = `Video file (${(decoded.length / 1024).toFixed(0)} KB) received and stored in video archive.`;
+        } else {
+          rawAnalysis = `Document (${fileName || "file"}) received and stored in document archive.`;
+        }
+      });
+
+      // 3. Enclose description in appropriate tag
+      let mediaDescription = "";
+      if (isAudio) {
+        mediaDescription = `<audio_message>\n${rawAnalysis}\n</audio_message>`;
+      } else if (isImage) {
+        mediaDescription = `<Image_message>\n${rawAnalysis}\n</Image_message>`;
+      } else {
+        mediaDescription = `<Media_description>\n${rawAnalysis}\n</Media_description>`;
+      }
+
+      // Metadata-only log: Never log phone numbers, keys, content, or signed URL
+      debugLog("MEDIA_PROCESS_SUCCESS", "Media process completed", {
+        mediaType: rawMediaType,
+        uploaded: storageResult.uploaded,
+      });
+
+      return res.json({
+        ok: true,
+        mediaType: rawMediaType,
+        mediaDescription,
+        Media_description: mediaDescription,
+        storagePath: storageResult.path,
+        uploaded: storageResult.uploaded,
+      });
+    } catch (error) {
+      debugLog("MEDIA_PROCESS_ERROR", "Media process failed", { error: error?.message });
+      return jsonError(res, 502, "Media processing failed; please retry");
+    }
+  }
+);
 
 app.get("/", (_req, res) => res.json({ service: "HexaSynq Gateway", ok: true }));
 app.get("/health/live", (_req, res) => res.json({ ok: true, status: "live" }));
