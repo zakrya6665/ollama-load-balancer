@@ -614,8 +614,8 @@ async function pollinationsChat(messages) {
       messages,
       max_completion_tokens: POLLINATIONS_MAX_COMPLETION_TOKENS,
       stream: false,
-      safe: true,
-      reasoning_effort: "none",
+      safe: false,
+      reasoning_effort: "low",
       temperature: 0,
     };
 
