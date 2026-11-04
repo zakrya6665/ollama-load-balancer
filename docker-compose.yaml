@@ -27,6 +27,9 @@ services:
       PORT: 3000
       INSTANCE_CREATE_LIMIT: "${INSTANCE_CREATE_LIMIT}"
       ENABLE_LOGS_DEBUG: "${ENABLE_LOGS_DEBUG}"
+      SUPABASE_URL: "${SUPABASE_URL:-https://datacore-qw8cvyeyjo.hexabizsolutions.cloud}"
+      SUPABASE_SERVICE_ROLE_KEY: "${SUPABASE_SERVICE_ROLE_KEY}"
+      SUPABASE_BUCKET: "${SUPABASE_BUCKET:-WA-Copilot}"
       OLLAMA_DEFAULT_MODEL: "synq:latest"
       OLLAMA_RUNNERS: "http://ollama:11434"
       EVOLUTION_SERVER_URL: "http://whatsapp_api:8080"
