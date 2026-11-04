@@ -1340,6 +1340,28 @@ function webhookDedupeKey(body, eventName, instanceName, messageId, status = "")
   if (messageId) return `${instanceName}:${eventName}:${messageId}${status ? `:${status}` : ""}`;
   return `${instanceName}:${eventName}:${crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex")}`;
 }
+function presencePhoneNumber(data, key, presences) {
+  const candidates = [
+    data?.phoneNumber,
+    data?.senderPn,
+    data?.remoteJidAlt,
+    data?.chatId,
+    key?.senderPn,
+    key?.remoteJidAlt,
+    key?.remoteJid,
+    data?.id,
+    ...Object.keys(presences || {}),
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const value = candidate.trim();
+    const jid = value.match(/^([0-9]+)(?::[0-9]+)?@(s\.whatsapp\.net|c\.us)$/i);
+    const directPhone = /^\+?[0-9]{8,15}$/.test(value) ? value.replace(/\D/g, "") : "";
+    const digits = jid?.[1] || directPhone;
+    if (digits.length >= 8 && digits.length <= 15) return digits;
+  }
+  return "";
+}
 app.post("/webhook/evolution", (req, res) => {
   if (!webhookAuthorized(req)) return jsonError(res, 401, "Invalid webhook secret");
   const body = req.body && typeof req.body === "object" ? req.body : {};
@@ -1368,15 +1390,27 @@ app.post("/webhook/evolution", (req, res) => {
   const mapped = eventMap.find(([prefix]) => eventName === prefix || eventName.startsWith(`${prefix}.`));
   if (!mapped) return res.status(200).json({ ok: true, ignored: true, reason: "unsupported_event", event: eventName });
 
-  const messageId = webhookMessageId(data, key);
+  const isPresenceEvent = mapped[1] === "PRESENCE_UPDATE";
+  // Presence data.id is usually the contact JID, not a unique event ID.
+  // Do not use it as a 10-minute message dedupe key.
+  const messageId = isPresenceEvent ? "" : webhookMessageId(data, key);
   const statusText = String(data.update?.status || data.status || "");
   const dedupeKey = webhookDedupeKey(body, eventName, instanceName, messageId, statusText);
-  cleanExpired(webhookDedupeCache, 10 * 60_000);
-  if (webhookDedupeCache.has(dedupeKey) || webhookInFlight.has(dedupeKey)) {
-    return res.status(200).json({ ok: true, duplicate: true });
+  if (isPresenceEvent) {
+    // Suppress only concurrent delivery of the same event. Later presence
+    // transitions for this contact must not be held behind the message TTL.
+    if (webhookInFlight.has(dedupeKey)) {
+      return res.status(200).json({ ok: true, duplicate: true });
+    }
+    webhookInFlight.add(dedupeKey);
+  } else {
+    cleanExpired(webhookDedupeCache, 10 * 60_000);
+    if (webhookDedupeCache.has(dedupeKey) || webhookInFlight.has(dedupeKey)) {
+      return res.status(200).json({ ok: true, duplicate: true });
+    }
+    rememberOnce(webhookDedupeCache, dedupeKey, 10 * 60_000, 20_000);
+    webhookInFlight.add(dedupeKey);
   }
-  rememberOnce(webhookDedupeCache, dedupeKey, 10 * 60_000, 20_000);
-  webhookInFlight.add(dedupeKey);
 
   const rawMsg = data.message || data;
   const { message: effectiveMsg, isViewOnce } = unwrapMessage(rawMsg);
@@ -1385,7 +1419,9 @@ app.post("/webhook/evolution", (req, res) => {
   const firstPresence = Object.values(presencesObj)[0];
   const presenceState = String(firstPresence?.lastKnownPresence || data.presence || data.status || data.state || "").toLowerCase();
   const isOnline = presenceState === "available" || presenceState === "composing" || presenceState === "recording" || presenceState === "online";
-  const cleanPhone = rawJid.substring(0, 30).replace(/[^0-9]/g, "");
+  const cleanPhone = isPresenceEvent
+    ? presencePhoneNumber(data, key, presencesObj)
+    : rawJid.substring(0, 30).replace(/[^0-9]/g, "");
 
   const payload = {
     eventId: crypto.createHash("sha256").update(dedupeKey).digest("hex"),
