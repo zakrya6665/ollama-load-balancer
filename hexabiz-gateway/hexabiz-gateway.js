@@ -45,7 +45,6 @@ const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY || "";
 const POLLINATIONS_MODEL = process.env.POLLINATIONS_MODEL || "openai/gpt-5.4-nano";
 // Media-specific Pollinations model names (configurable without code changes)
 const POLLINATIONS_AUDIO_MODEL = process.env.POLLINATIONS_AUDIO_MODEL || "microsoft/mai-transcribe-2";
-const POLLINATIONS_IMAGE_MODEL = process.env.POLLINATIONS_IMAGE_MODEL || "openai";
 // Maximum decoded media bytes accepted by the media endpoints.
 const MAX_MEDIA_DECODED_BYTES = positiveInt(process.env.MAX_MEDIA_DECODED_BYTES, 8 * 1_048_576);
 // Per-IP rate limit for media endpoints (requests per window).
@@ -186,6 +185,89 @@ async function uploadToSupabaseStorage(phoneNumber, mediaType, mimeType, fileBuf
   }
 }
 
+function parseMcpJsonResponse(bodyText, contentType = "") {
+  if (!bodyText.trim()) return null;
+  if (contentType.includes("application/json")) {
+    try { return JSON.parse(bodyText); } catch { return null; }
+  }
+  const messages = bodyText
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trim())
+    .filter(Boolean);
+  for (const message of messages.reverse()) {
+    try { return JSON.parse(message); } catch { /* try next SSE data block */ }
+  }
+  try { return JSON.parse(bodyText); } catch { return null; }
+}
+
+async function transcribeAudioFromUrl(audioUrl, language = "") {
+  if (!POLLINATIONS_API_KEY) throw new Error("Pollinations API key is not configured");
+  const endpoint = `${POLLINATIONS_BASE_URL}/mcp/pollinations`;
+  const headers = {
+    authorization: `Bearer ${POLLINATIONS_API_KEY}`,
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+  };
+  const postMcp = async (payload, sessionId = "") => {
+    const requestHeaders = { ...headers };
+    if (payload.method !== "initialize") requestHeaders["mcp-protocol-version"] = "2025-03-26";
+    if (sessionId) requestHeaders["mcp-session-id"] = sessionId;
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(AI_TIMEOUT_MS),
+    });
+    const responseText = await response.text();
+    if (!response.ok) throw new Error(`Pollinations audio URL transcription returned HTTP ${response.status}`);
+    return {
+      data: parseMcpJsonResponse(responseText, response.headers.get("content-type") || ""),
+      sessionId: response.headers.get("mcp-session-id") || sessionId,
+    };
+  };
+
+  const initialized = await postMcp({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "hexasynq-gateway", version: "1.0.0" },
+    },
+  });
+  if (initialized.data?.error) throw new Error("Pollinations MCP initialization failed");
+  const sessionId = initialized.sessionId;
+  await postMcp({ jsonrpc: "2.0", method: "notifications/initialized" }, sessionId);
+
+  const listed = await postMcp({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, sessionId);
+  const tool = listed.data?.result?.tools?.find((item) => item.name === "transcribeAudio");
+  const properties = tool?.inputSchema?.properties || {};
+  const audioUrlField = ["audioUrl", "audio_url", "url"].find((key) => properties[key]);
+  if (!audioUrlField) throw new Error("Pollinations audio URL transcription tool is unavailable");
+  const args = { [audioUrlField]: audioUrl };
+  if (language && properties.language) args.language = language;
+  if (properties.model) args.model = POLLINATIONS_AUDIO_MODEL;
+  const called = await postMcp({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "tools/call",
+    params: { name: "transcribeAudio", arguments: args },
+  }, sessionId);
+  const result = called.data?.result;
+  if (!result || result.isError || called.data?.error) {
+    throw new Error("Pollinations failed to transcribe the stored audio URL");
+  }
+  const structured = result.structuredContent || {};
+  const transcript = structured.transcript || structured.text || structured.content ||
+    result.content?.find((item) => item.type === "text")?.text;
+  if (typeof transcript !== "string" || !transcript.trim()) {
+    throw new Error("Pollinations returned an empty transcription for the stored audio URL");
+  }
+  return transcript.trim();
+}
+
 // Debug Logging Configuration
 const ENABLE_LOGS_DEBUG = process.env.ENABLE_LOGS_DEBUG === "true";
 
@@ -280,10 +362,22 @@ app.use(express.json({
 // GLOBAL DEBUG LOGGING MIDDLEWARE
 // ============================================================================
 app.use((req, res, next) => {
+  const headersForLog = { ...req.headers };
+  for (const name of ["authorization", "x-enrollment-key", "x-signature", "x-api-key"]) {
+    if (headersForLog[name]) headersForLog[name] = "[redacted]";
+  }
+  const isMediaRequest = req.originalUrl.startsWith("/api/media/") || req.originalUrl.startsWith("/v1/audio/transcriptions");
+  const bodyForLog = isMediaRequest && req.body && typeof req.body === "object"
+    ? Object.fromEntries(Object.entries(req.body).map(([key, value]) =>
+      /base64|^audio$/i.test(key) && typeof value === "string"
+        ? [key, `[redacted ${Buffer.byteLength(value, "utf8")} encoded bytes]`]
+        : [key, value]
+    ))
+    : req.body;
   debugLog("HTTP_IN", `${req.method} ${req.originalUrl}`, {
-    headers: req.headers,
-    body: req.body,
-    rawBodyPreview: req.rawBody ? req.rawBody.slice(0, 500) + (req.rawBody.length > 500 ? "...[truncated]" : "") : undefined
+    headers: headersForLog,
+    body: bodyForLog,
+    rawBodyPreview: isMediaRequest ? "[media request body omitted]" : req.rawBody ? req.rawBody.slice(0, 500) + (req.rawBody.length > 500 ? "...[truncated]" : "") : undefined
   });
 
   // Intercept res.json to log outgoing responses
@@ -713,7 +807,16 @@ async function pollinationsChat(messages) {
       temperature: 0,
     };
 
-    debugLog("POLLINATIONS_REQ", `Calling ${POLLINATIONS_BASE_URL}/v1/chat/completions`, { model: POLLINATIONS_MODEL, messages, max_completion_tokens: POLLINATIONS_MAX_COMPLETION_TOKENS });
+    debugLog("POLLINATIONS_REQ", `Calling ${POLLINATIONS_BASE_URL}/v1/chat/completions`, {
+      model: POLLINATIONS_MODEL,
+      messageCount: messages.length,
+      messageShapes: messages.map((message) => ({
+        role: message.role,
+        contentType: Array.isArray(message.content) ? "multimodal" : "text",
+        partTypes: Array.isArray(message.content) ? message.content.map((part) => part.type) : undefined,
+      })),
+      max_completion_tokens: POLLINATIONS_MAX_COMPLETION_TOKENS,
+    });
 
     const response = await fetch(`${POLLINATIONS_BASE_URL}/v1/chat/completions`, {
       method: "POST",
@@ -801,47 +904,6 @@ function decodeBase64Field(res, value, fieldName) {
   return decoded;
 }
 
-async function pollinationsMediaRequest(endpoint, bodyObj) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
-  try {
-    debugLog("POLLINATIONS_MEDIA_REQ", `Calling ${POLLINATIONS_BASE_URL}${endpoint}`, { body: bodyObj });
-    const headers = { "content-type": "application/json", accept: "application/json" };
-    if (POLLINATIONS_API_KEY) headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
-    
-    const response = await fetch(`${POLLINATIONS_BASE_URL}${endpoint}`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(bodyObj),
-      signal: controller.signal,
-    });
-    
-    const text = await response.text();
-    let data;
-    try { data = text ? JSON.parse(text) : {}; } catch { data = {}; }
-    
-    debugLog("POLLINATIONS_MEDIA_RES", `Response from ${endpoint}`, { status: response.status, data });
-    
-    if (!response.ok) {
-      const error = new Error(`Pollinations returned HTTP ${response.status}`);
-      error.status = response.status >= 500 ? 502 : response.status;
-      throw error;
-    }
-    return data;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function extractOpenAiContent(data) {
-  try {
-    const content = data?.choices?.[0]?.message?.content;
-    return typeof content === "string" && content.trim() ? content.trim() : null;
-  } catch {
-    return null;
-  }
-}
-
 // ============================================================================
 // POST /api/media/transcribe & /v1/audio/transcriptions
 // ============================================================================
@@ -878,10 +940,6 @@ app.post(
       }
     }
 
-    if (!POLLINATIONS_API_KEY) {
-      process.stderr.write("[MEDIA:TRANSCRIBE] Warning: POLLINATIONS_API_KEY is not set; sending request without auth\n");
-    }
-
     const decoded = decodeBase64Field(res, req.body?.audio, "audio");
     if (!decoded) return;
 
@@ -891,53 +949,20 @@ app.post(
 
     try {
       debugLog("MEDIA_TRANSCRIBE_START", "Starting transcription task", { mimeType: audioFormat.mime, language, audioSizeBytes: decoded.length });
+      const ownerPhone = String(req.body?.ownerPhone || req.body?.phoneNumber || "").replace(/\D/g, "");
+      const storageResult = await uploadToSupabaseStorage(
+        ownerPhone,
+        "audio",
+        audioFormat.mime,
+        decoded,
+        req.body?.fileName || ""
+      );
+      if (!storageResult.uploaded || !storageResult.signedUrl) {
+        return jsonError(res, 502, "Audio could not be stored for URL-based transcription; please retry");
+      }
       
       const transcript = await runAiTask(async () => {
-        const form = new FormData();
-        form.set("file", new Blob([decoded], { type: audioFormat.mime }), `recording.${audioFormat.extension}`);
-        form.set("model", POLLINATIONS_AUDIO_MODEL);
-        form.set("response_format", "json");
-        form.set("temperature", "0");
-        if (language) form.set("language", language);
-
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
-
-        try {
-          debugLog("POLLINATIONS_TRANSCRIBE_REQ", `Calling ${POLLINATIONS_BASE_URL}/v1/audio/transcriptions`, { model: POLLINATIONS_AUDIO_MODEL, language });
-          
-          const headers = { accept: "application/json" };
-          if (POLLINATIONS_API_KEY) headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
-
-          const response = await globalThis.fetch(`${POLLINATIONS_BASE_URL}/v1/audio/transcriptions`, {
-            method: "POST",
-            headers,
-            body: form,
-            signal: controller.signal,
-          });
-
-          const responseText = await response.text();
-          let data;
-          try { data = responseText ? JSON.parse(responseText) : {}; } catch { data = { text: responseText }; }
-          
-          debugLog("POLLINATIONS_TRANSCRIBE_RES", `Response from Transcription`, { status: response.status, data });
-
-          if (!response.ok) {
-            const error = new Error(`Pollinations transcription returned HTTP ${response.status}`);
-            error.status = response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status;
-            throw error;
-          }
-
-          const text = typeof data?.text === "string" ? data.text.trim() : typeof data?.transcript === "string" ? data.transcript.trim() : typeof data === "string" ? data.trim() : "";
-          if (!text) {
-            const error = new Error("Pollinations returned an empty transcription");
-            error.status = 502;
-            throw error;
-          }
-          return text;
-        } finally {
-          clearTimeout(timeout);
-        }
+        return transcribeAudioFromUrl(storageResult.signedUrl, language);
       });
 
       debugLog("MEDIA_TRANSCRIBE_SUCCESS", "Transcription completed successfully", { transcriptPreview: transcript.slice(0, 100) });
@@ -964,48 +989,49 @@ app.post("/api/media/analyse", requireEnrollment, requireMediaRateLimit, async (
   const decoded = decodeBase64Field(res, req.body?.imageBase64, "imageBase64");
   if (!decoded) return;
 
-  const imageBase64 = req.body.imageBase64;
-  const dataUri = `data:image/jpeg;base64,${imageBase64}`;
-
   if (aiQueue.length >= MAX_AI_QUEUE && aiActive >= MAX_AI_CONCURRENCY) {
     return jsonError(res, 429, "AI queue is full; retry shortly");
   }
 
   try {
     debugLog("MEDIA_ANALYSE_START", "Starting image analysis task", { imageSizeBytes: decoded.length });
+    const ownerPhone = String(req.body?.ownerPhone || req.body?.phoneNumber || "").replace(/\D/g, "");
+    const storageResult = await uploadToSupabaseStorage(
+      ownerPhone,
+      "image",
+      "image/jpeg",
+      decoded,
+      req.body?.fileName || ""
+    );
+    if (!storageResult.uploaded || !storageResult.signedUrl) {
+      return jsonError(res, 502, "Image could not be stored for URL-based analysis; please retry");
+    }
     
     const result = await runAiTask(async () => {
-      const body = {
-        model: POLLINATIONS_IMAGE_MODEL,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: `Analyse this image and respond in this exact JSON format:
+      const { content } = await pollinationsChat([
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `Analyse this image and respond in this exact JSON format:
 {
 "description": "<1-2 sentence description of what you see>",
 "quality": "<good|average|poor>",
 "appraisal": "<if quality is good, write a warm enthusiastic compliment for the sender (1 sentence). If average or poor, leave this field as an empty string>"
 }
 Return only valid JSON. Do not add markdown fences or any other text outside the JSON object.`,
-              },
-              { type: "image_url", image_url: { url: dataUri, detail: "auto" } },
-            ],
-          },
-        ],
-        max_tokens: 512,
-      };
-
-      const data = await pollinationsMediaRequest("/openai", body);
-      const raw = extractOpenAiContent(data);
-      if (!raw) {
+            },
+            { type: "image_url", image_url: { url: storageResult.signedUrl, detail: "auto" } },
+          ],
+        },
+      ]);
+      if (!content) {
         const error = new Error("Pollinations returned an empty image analysis");
         error.status = 502;
         throw error;
       }
-      return raw;
+      return content;
     });
 
     let description = "";
@@ -1065,6 +1091,14 @@ app.post(
         decoded,
         fileName
       );
+      if (!storageResult.uploaded || !storageResult.signedUrl) {
+        debugLog("MEDIA_PROCESS_STORAGE_REQUIRED", "Media analysis stopped because Supabase upload or signed URL creation failed", {
+          mediaType: rawMediaType,
+          uploaded: storageResult.uploaded,
+          signedUrlAvailable: Boolean(storageResult.signedUrl),
+        });
+        return jsonError(res, 502, "Media could not be stored for URL-based analysis; please retry");
+      }
 
       // 2. Perform AI Analysis
       const isImage = rawMediaType === "image" || mimeType.startsWith("image/");
@@ -1074,42 +1108,19 @@ app.post(
       let rawAnalysis = "";
       await runAiTask(async () => {
         if (isImage) {
-          const imageUrl = storageResult.signedUrl || `data:image/jpeg;base64,${base64Content}`;
-          const body = {
-            model: POLLINATIONS_IMAGE_MODEL,
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "text",
-                    text: "Analyze this image in 1-2 clear, informative sentences for a user assistant.",
-                  },
-                  { type: "image_url", image_url: { url: imageUrl, detail: "auto" } },
-                ],
-              },
-            ],
-            max_tokens: 300,
-          };
-          const data = await pollinationsMediaRequest("/openai", body);
-          rawAnalysis = extractOpenAiContent(data) || "Image received and stored.";
+          const response = await pollinationsChat([
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "Analyze this image in 1-2 clear, informative sentences for a user assistant." },
+                { type: "image_url", image_url: { url: storageResult.signedUrl, detail: "auto" } },
+              ],
+            },
+          ]);
+          rawAnalysis = response.content;
         } else if (isAudio) {
-          const form = new FormData();
-          form.set("file", new Blob([decoded], { type: mimeType || "audio/ogg" }), `recording.ogg`);
-          form.set("model", POLLINATIONS_AUDIO_MODEL);
-          form.set("response_format", "json");
-          if (ownerPhone.startsWith("92")) form.set("language", "ur");
-
-          const headers = { accept: "application/json" };
-          if (POLLINATIONS_API_KEY) headers.authorization = `Bearer ${POLLINATIONS_API_KEY}`;
-
-          const response = await globalThis.fetch(`${POLLINATIONS_BASE_URL}/v1/audio/transcriptions`, {
-            method: "POST",
-            headers,
-            body: form,
-          });
-          const resData = await response.json().catch(() => ({}));
-          rawAnalysis = (resData?.text || resData?.transcript || "Audio recorded.").trim();
+          const language = ownerPhone.startsWith("92") ? "ur" : "";
+          rawAnalysis = await transcribeAudioFromUrl(storageResult.signedUrl, language);
         } else if (isVideo) {
           rawAnalysis = `Video file (${(decoded.length / 1024).toFixed(0)} KB) received and stored in video archive.`;
         } else {
